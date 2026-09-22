@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Isolated HTTP acceptance. No production keys, ports or daemons."""
+import json,os,pathlib,socket,subprocess,tempfile,threading,time,urllib.request,urllib.error,http.server,http.cookiejar
+ROOT=pathlib.Path(__file__).resolve().parents[1]
+seen=[]
+hooks=[]
+candy_answer="21"
+monitor_delay=0
+probe_throttled=False
+monitor_started=threading.Event()
+class Upstream(http.server.BaseHTTPRequestHandler):
+ def log_message(self,*args):pass
+ def do_GET(self):
+  b=json.dumps({'mode':'unrestricted','remaining':100,'unit':'USD'}).encode();self.send_response(200);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+ def do_POST(self):
+  b=self.rfile.read(int(self.headers.get('Content-Length','0')));d=json.loads(b);seen.append((self.path,dict(self.headers),d))
+  if self.path=='/hook':
+   hooks.append(d);out=b'{"code":0}';self.send_response(200);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+  if self.path.endswith('/chat/completions'):
+   monitor_started.set();time.sleep(monitor_delay)
+   out=json.dumps({'choices':[{'message':{'content':candy_answer},'finish_reason':'stop'}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+  if self.path.startswith('/early/'):
+   out=b'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n';self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+  if self.path.startswith('/review/'):
+   name=self.path.split('/')[2];status=200;ct='text/event-stream'
+   delta=b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+   failed=b'data: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n'
+   if name=='large':out=b'data: '+json.dumps({'response':{'status':'completed','output':[],'pad':'P'*70000},'type':'response.completed'}).encode()+b'\n\n'
+   elif name=='alias':out=b'data: {"type":"response.done"}\n\n'
+   elif name=='unknownterminal':out=delta
+   elif name in ('together','split'):out=delta+failed
+   elif name=='silent':out=b'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'
+   elif name=='huge':ct='application/json';out=json.dumps({'status':'completed','output':[],'pad':'x'*(9*1024*1024)}).encode()
+   elif name=='input':status=400;ct='application/json';out=b'{"error":{"message":"Unsupported parameter: foo"}}'
+   elif name=='validation':status=422;ct='application/json';out=b'{"detail":[{"msg":"field required"}]}'
+   elif name=='okextra':ct='application/json';out=b'{"status":"completed","output":[],"code":"ok","error":{}}'
+   else:raise AssertionError(name)
+   self.send_response(status);self.send_header('Content-Type',ct);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.flush()
+   try:
+    if name=='silent':time.sleep(11)
+    if name=='split':self.wfile.write(delta);self.wfile.flush();time.sleep(.15);self.wfile.write(failed)
+    else:self.wfile.write(out)
+   except (BrokenPipeError,ConnectionResetError):pass
+   return
+  if probe_throttled and self.path=='/ok/v1/responses' and d.get('input')=='Reply OK.':
+   self.send_response(429);self.send_header('Retry-After','120');self.send_header('Content-Length','0');self.end_headers();return
+  variants={'/jsonauth/':(200,{'code':401,'msg':'令牌已过期或验证不正确','success':False}),'/unknown/':(200,{'success':False,'code':937,'msg':'unknown vendor error'}),'/input/':(400,{'error':{'code':'context_length_exceeded','message':'too long'}})}
+  for prefix,(status,value) in variants.items():
+   if self.path.startswith(prefix):
+    out=json.dumps(value).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+  if self.path.startswith('/bad/'):
+   self.send_response(503);self.send_header('Content-Length','0');self.end_headers();return
+  if self.path.startswith('/empty/'):
+   b=b'{"error":{"code":"insufficient_quota"}}';self.send_response(429);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
+  if d.get('stream'):
+   b=b'event: response.created\ndata: {"type":"response.created"}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n';ct='text/event-stream'
+  else:b=b'{"id":"test","status":"completed","output":[]}';ct='application/json'
+  self.send_response(200);self.send_header('Content-Type',ct);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+def freeport():
+ s=socket.socket();s.bind(('127.0.0.1',0));p=s.getsockname()[1];s.close();return p
+def main():
+ global candy_answer,monitor_delay,probe_throttled
+ server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream);threading.Thread(target=server.serve_forever,daemon=True).start();up=server.server_port
+ with tempfile.TemporaryDirectory(prefix='forest-check-') as temp:
+  port=freeport();base=f'http://127.0.0.1:{port}';env=dict(os.environ,FOREST_ROUTER_HOME=temp,FOREST_LISTEN=f'127.0.0.1:{port}',FOREST_ADMIN_PASSWORD='test-password',FOREST_API_KEY='company-secret')
+  proc=subprocess.Popen([str(ROOT/'target/debug/forest-router')],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+  def request(path,data=None,auth=False):
+   h={'content-type':'application/json','x-forest-admin':'1'}
+   if auth:h['Authorization']='Bearer company-secret'
+   req=urllib.request.Request(base+path,data=None if data is None else json.dumps(data).encode(),headers=h)
+   try:
+    with opener.open(req,timeout=20) as r:
+     raw=r.read()
+     if path=='/admin/api/save' and r.status==200:data['_revision']=json.loads(raw)['revision']
+     return r.status,raw
+   except urllib.error.HTTPError as e:return e.code,e.read()
+  try:
+   for _ in range(100):
+    try:request('/');break
+    except OSError:time.sleep(.05)
+   assert request('/admin/api/state')[0]==401
+   assert request('/v1/models')[0]==401
+   assert json.loads(request('/v1/models',auth=True)[1])=={'object':'list','data':[]}
+   assert request('/admin/api/login',{'password':'test-password'})[0]==200
+   cfg=json.loads(request('/admin/api/state')[1])['config'];assert 'admin_password_hash' not in cfg
+   assert len(cfg['monitor_schedule'])==4
+   bad=json.loads(json.dumps(cfg));bad['monitor_schedule']=[{'start':0,'end':0,'interval_minutes':5},{'start':60,'end':120,'interval_minutes':10}]
+   assert request('/admin/api/save',bad)[0]==400
+   cfg['monitor_schedule'][0]['interval_minutes']=10
+   assert request('/admin/api/save',cfg)[0]==200
+   assert json.loads(request('/admin/api/state')[1])['config']['monitor_schedule'][0]['interval_minutes']==10
+   cfg['monitor_schedule'][0]['interval_minutes']=5
+   assert request('/admin/api/save',cfg)[0]==200
+   def channel(i,path):return {'id':i,'name':i,'base_url':f'http://127.0.0.1:{up}/{path}/v1','upstream_model':'upstream-model','adapter':'sub2_api','enabled':True,'keys':[{'id':i+'-key','label':i,'secret':'upstream-secret'}]}
+   cfg['models']=[{'id':'test-model','channels':[channel('broken','bad'),channel('good','ok')]}]
+   assert request('/admin/api/save',cfg)[0]==200
+   status,catalog=request('/v1/models',auth=True);assert status==200
+   assert json.loads(catalog)=={'object':'list','data':[{'id':'test-model','object':'model','created':0,'owned_by':'forest-router'}]}
+   assert b'upstream-secret' not in catalog and b'upstream-model' not in catalog
+   payload={'model':'test-model','input':'hello','stream':True,'reasoning':{'effort':'high'},'unknown':{'nested':[1,True,'untouched']}}
+   assert request('/v1/responses',payload)[0]==401
+   status,body=request('/v1/responses',payload,True);assert status==200 and b'response.completed' in body
+   assert seen[-2][0]=='/bad/v1/responses' and seen[-1][0]=='/ok/v1/responses'
+   assert seen[-1][2]==dict(payload,model='upstream-model')
+   assert seen[-1][1].get('authorization')=='Bearer upstream-secret'
+   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['broken-key']['service_failed'];assert state['last_used']['test-model']=='good'
+   before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1
+   assert request('/v1/responses',dict(payload,model='missing'),True)[0]==404
+   assert request('/v1/responses',dict(payload,previous_response_id='private'),True)[0]==400
+   assert request('/admin/api/verify',{'channel_id':'good'})[0]==200
+   # Disabled providers/keys never enter request candidate rotation.
+   first=channel('switches','ok/switches');first['keys']=[{'id':'off-key','label':'off','secret':'disabled-secret','enabled':False},{'id':'on-key','label':'on','secret':'enabled-secret','enabled':True}]
+   cfg['models'][0]['channels']=[first,channel('fallback','ok/fallback')];assert request('/admin/api/save',cfg)[0]==200
+   before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1 and seen[-1][1].get('authorization')=='Bearer enabled-secret'
+   first['keys'][1]['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/fallback/v1/responses'
+   first['keys'][1]['enabled']=True;first['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/fallback/v1/responses'
+   first['enabled']=True;assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/switches/v1/responses'
+   cfg['models'][0]['channels']=[channel('empty','empty'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',payload,True)[0]==200
+   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['empty-key']['allowance']['exhausted'];assert 'broken-key' not in state['keys']
+   cfg['models'][0]['channels']=[channel('early','early'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
+   status,body=request('/v1/responses',payload,True);assert status==200 and b'response.failed' not in body
+   cfg['webhook']=f'http://127.0.0.1:{up}/hook';cfg['monitors']=[{'id':'quality','name':'quality','base_url':f'http://127.0.0.1:{up}/v1','key':'monitor-key','model':'test'}]
+   cfg['models'][0]['channels']=[channel('watched','ok')];cfg['models'][0]['channels'][0]['monitor_id']='quality';assert request('/admin/api/save',cfg)[0]==200
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   assert request('/v1/responses',payload,True)[0]==200
+   monitor_started.clear();monitor_delay=1
+   checks=[];worker=threading.Thread(target=lambda:checks.append(request('/admin/api/verify',{'monitor_id':'quality'})[0]));worker.start()
+   assert monitor_started.wait(5)
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==409
+   worker.join();assert checks==[200];monitor_delay=0
+   candy_answer='20';assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   assert request('/v1/responses',payload,True)[0]==503
+   for _ in range(80):
+    if hooks:break
+    time.sleep(.1)
+   assert len(hooks)==1, hooks
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   assert not json.loads(request('/admin/api/state')[1])['state']['notices']
+   candy_answer='21';assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   assert request('/v1/responses',payload,True)[0]==200
+   cfg['webhook']=''
+   for prefix,flag in [('jsonauth','credential_failed'),('unknown','service_failed')]:
+    cfg['models'][0]['channels']=[channel(prefix,prefix),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
+    status,body=request('/v1/responses',payload,True);assert status==200 and b'response.completed' in body
+    state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys'][prefix+'-key'][flag]
+    before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1
+   cfg['models'][0]['channels']=[channel('input','input'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
+   before=len(seen);assert request('/v1/responses',payload,True)[0]==400;assert len(seen)==before+1
+   cfg['models'][0]['channels']=[channel('duplicate1','bad'),channel('duplicate2','bad'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
+   before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+2
+   cfg['models'][0]['channels']=[channel('cap'+str(i),'bad/'+str(i)) for i in range(10)];assert request('/admin/api/save',cfg)[0]==200
+   before=len(seen);assert request('/v1/responses',payload,True)[0]==503;assert len(seen)==before+8
+   for name,expected in [('large',200),('alias',200),('unknownterminal',200),('together',200),('split',200),('silent',200),('huge',502),('input',400),('validation',422),('okextra',200)]:
+    cfg['models'][0]['channels']=[channel('review-'+name,'review/'+name),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
+    before=len(seen);status,body=request('/v1/responses',payload,True)
+    assert status==expected,(name,status,body[:200]);assert len(seen)==before+1,(name,'request replayed')
+    state=json.loads(request('/admin/api/state')[1])['state'];key=state['keys']['review-'+name+'-key']
+    assert key['service_failed']==(name in ('together','split')),(name,key)
+    if name=='large':assert b'P'*70000 in body
+    if name=='huge':assert b'response_too_large' in body
+    if name in ('together','split'):assert b'hello' in body and b'response.failed' in body
+   # Last-write-wins is rejected; a stale editor cannot overwrite a newer save.
+   stale=json.loads(json.dumps(cfg));assert request('/admin/api/save',cfg)[0]==200
+   cfg['api_key']='company-secret-2';assert request('/admin/api/save',cfg)[0]==200
+   assert request('/admin/api/save',stale)[0]==409
+   cfg['api_key']='company-secret';assert request('/admin/api/save',cfg)[0]==200
+   cfg['models'][0]['channels']=[channel('allbad','bad')];assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',payload,True)[0]==503
+   before=len(seen);cfg['models'][0]['id']='renamed-model';assert request('/admin/api/save',cfg)[0]==200
+   assert len(seen)==before
+   assert json.loads(request('/admin/api/state')[1])['state']['keys']['allbad-key']['service_failed']
+   cfg['models'][0]['id']='test-model';assert request('/admin/api/save',cfg)[0]==200
+   assert len(json.loads(request('/admin/api/state')[1])['state']['events'])<=200
+   # Persisted failures survive graceful restart; manual reset requires actual success.
+   cfg['models'][0]['channels']=[channel('recover','ok')];assert request('/admin/api/save',cfg)[0]==200
+   proc.terminate();proc.wait(timeout=10)
+   statepath=pathlib.Path(temp,'state.json');saved=json.loads(statepath.read_text());now=int(time.time())
+   saved['keys']['recover-key'].update(service_failed=True,cooldown_until=now+600,retry_at=now-1,probe_attempts=4,recovery_successes=0,reason='fixture outage')
+   statepath.write_text(json.dumps(saved))
+   probe_throttled=True
+   configpath=pathlib.Path(temp,'config.json');disk=json.loads(configpath.read_text());disk['webhook']='http://127.0.0.1:1/unreachable';configpath.write_text(json.dumps(disk))
+   proc=subprocess.Popen([str(ROOT/'target/debug/forest-router')],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   for _ in range(100):
+    try:request('/');break
+    except OSError:time.sleep(.05)
+   assert request('/v1/responses',payload,True)[0]==503
+   assert request('/admin/api/login',{'password':'test-password'})[0]==200
+   for _ in range(60):
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['recover-key']
+    if key['retry_at']>now:break
+    time.sleep(.1)
+   assert key['probe_attempts']==4 and key['retry_at']>now and key['service_failed'],key
+   probe_throttled=False
+   assert request('/admin/api/verify',{'channel_id':'recover','reset':True})[0]==200
+   assert request('/v1/responses',payload,True)[0]==200
+
+   cfg=json.loads(request('/admin/api/state')[1])['config'];cfg['new_password']='changed-password';assert request('/admin/api/save',cfg)[0]==200
+   assert request('/admin/api/state')[0]==401
+   assert request('/admin/api/login',{'password':'changed-password'})[0]==200
+
+   print('PASS: login, configuration, SSE pass-through, header/model substitution, priority failover, failed candidate skip, unknown model, nonportable history, manual check, quota classification, cache cleanup, all unavailable')
+  finally:proc.terminate();proc.wait(timeout=5);server.shutdown()
+if __name__=='__main__':main()

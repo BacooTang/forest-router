@@ -1,0 +1,23 @@
+/target/
+/config.json
+/state.json
+/.runtime/
+*.tmp
+/data/
+/scripts/__pycache__/
+
+# Local credentials, logs, editor metadata and private evidence
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+.DS_Store
+__pycache__/
+*.py[cod]
+.codegraph/
+.idea/
+.vscode/

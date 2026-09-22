@@ -1,0 +1,17 @@
+[package]
+name = "forest-router"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+async-stream = "0.3"
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
