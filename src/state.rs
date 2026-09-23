@@ -91,6 +91,24 @@ impl State {
                     .is_some_and(|q| q.last_definite == "healthy" && q.valid_until > now)
             })
     }
+    pub fn prefer_verified(&mut self, model: &crate::config::Model, now: i64) {
+        let Some(channel) = model.channels.iter().find(|c| self.channel_ready(c, now)) else {
+            return;
+        };
+        let revision = self.sticky_routes.get(&model.id).map_or(0, |r| r.revision);
+        self.sticky_routes.insert(
+            model.id.clone(),
+            StickyRoute {
+                channel_id: channel.id.clone(),
+                recovered: HashMap::new(),
+                revision: revision + 1,
+            },
+        );
+        self.event(
+            "route",
+            format!("{}：手动验证完成，按顺位选择 {}", model.id, channel.name),
+        );
+    }
     pub fn route_order(&mut self, model: &crate::config::Model, now: i64) -> Vec<usize> {
         let ready: Vec<bool> = model
             .channels
@@ -247,6 +265,12 @@ mod tests {
         state.keys.get_mut("ka").unwrap().suspect = false;
         assert_eq!(state.route_order(&model, 200), vec![1, 0]);
         assert_eq!(state.route_order(&model, 799), vec![1, 0]);
+        let mut manual = state.clone();
+        let revision = manual.sticky_routes["m"].revision;
+        manual.prefer_verified(&model, 799);
+        assert_eq!(manual.route_order(&model, 799), vec![0, 1]);
+        assert!(manual.sticky_routes["m"].revision > revision);
+        assert!(manual.sticky_routes["m"].recovered.is_empty());
         assert_eq!(state.route_order(&model, 800), vec![0, 1]);
         state.keys.get_mut("ka").unwrap().suspect = true;
         state.route_order(&model, 801);

@@ -175,9 +175,11 @@ def main():
    transient_fail=True
    assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/standby/v1/responses'
    state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['transient-key']['suspect'] and not state['keys']['transient-key']['service_failed']
+   transient_fail=False
    assert request('/admin/api/verify',{'channel_id':'transient'})[0]==200
    state=json.loads(request('/admin/api/state')[1])['state'];assert not state['keys']['transient-key']['suspect']
-   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/standby/v1/responses'
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/transient/v1/responses'
+   transient_fail=True
    cfg['models'][0]['channels'][1]['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
    # A second business failure after successful tiny probe must escalate.
    assert request('/v1/responses',payload,True)[0]==503

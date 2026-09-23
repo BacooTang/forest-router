@@ -341,6 +341,23 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
         {
             complete &= crate::monitor::batch(&app, &cfg, vec![m.clone()]).await == Some(1);
         }
+        {
+            let current = app.config.read().await;
+            complete &= Arc::ptr_eq(&current, &cfg);
+            if complete {
+                let mut state = app.state.lock().await;
+                let now = chrono::Utc::now().timestamp();
+                let fresh_quality = c.monitor_id.as_ref().is_none_or(|id| {
+                    state
+                        .quality
+                        .get(id)
+                        .is_some_and(|q| q.verdict == "healthy" && q.valid_until > now)
+                });
+                if fresh_quality && state.channel_ready(c, now) {
+                    state.prefer_verified(model, now);
+                }
+            }
+        }
         let _ = app.persist().await;
         if !complete {
             return (
