@@ -61,6 +61,7 @@ pub struct Provider {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Metrics {
+    pub client_usage: crate::usage::Ledger,
     pub day: i64,
     pub today: Counts,
     pub hours: VecDeque<Bucket>,
@@ -70,6 +71,7 @@ pub struct Metrics {
 }
 impl Metrics {
     fn roll(&mut self, now: i64) {
+        self.client_usage.prune(now);
         let day = (now + 8 * 3600).div_euclid(86400);
         if self.day != day {
             self.day = day;
@@ -105,6 +107,8 @@ impl Metrics {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Attempt {
+    #[serde(default)]
+    pub usage: Option<crate::usage::Tokens>,
     pub channel_id: String,
     pub channel: String,
     pub key_id: String,
@@ -116,6 +120,10 @@ pub struct Attempt {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Report {
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_name: String,
     pub id: String,
     pub at: i64,
     pub model: String,
@@ -159,6 +167,18 @@ impl Trace {
             finished: false,
         };
         (trace, guard)
+    }
+    pub fn client(&self, id: String, name: String) {
+        let mut p = self.0.lock().unwrap();
+        p.report.client_id = id;
+        p.report.client_name = name;
+    }
+    pub fn usage(&self, usage: Option<crate::usage::Tokens>) {
+        if let Some(t) = usage
+            && let Some(a) = self.0.lock().unwrap().report.attempts.last_mut()
+        {
+            a.usage = Some(t);
+        }
     }
     pub fn id(&self) -> String {
         self.0.lock().unwrap().report.id.clone()
@@ -263,6 +283,8 @@ impl Guard {
         let mut m = self.metrics.lock().unwrap();
         m.roll(now);
         m.active = m.active.saturating_sub(1);
+        m.client_usage
+            .record(&r.client_id, &r.client_name, r.at, &r.attempts);
         // Daily outcomes belong to request start day, so yesterday's long streams do not skew today's rate.
         if (r.at + 8 * 3600).div_euclid(86400) == m.day {
             m.today.result(&r.outcome, r.first_ms);

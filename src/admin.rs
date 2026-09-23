@@ -95,6 +95,7 @@ pub async fn state(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
         .remove("admin_password_hash");
     config["_revision"] = json!(cfg.digest());
     let state = app.state.lock().await.clone();
+    let usage = app.metrics.lock().unwrap().snapshot().client_usage;
     let routing: std::collections::HashMap<_, _> = cfg
         .models
         .iter()
@@ -110,7 +111,7 @@ pub async fn state(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
         .collect();
     (
         [("cache-control", "no-store")],
-        Json(json!({"config":config,"state":state,"routing":routing,"traffic":app.metrics.lock().unwrap().view()})),
+        Json(json!({"config":config,"state":state,"routing":routing,"traffic":app.metrics.lock().unwrap().view(),"client_usage":usage})),
     )
         .into_response()
 }
@@ -137,6 +138,9 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
             "配置已被修改或缺少版本号，请刷新后重新编辑",
         )
             .into_response();
+    }
+    if v.get("employee_keys").is_none() {
+        v["employee_keys"] = json!(old.employee_keys);
     }
     v["admin_password_hash"] = json!(old.admin_password_hash);
     let password = v

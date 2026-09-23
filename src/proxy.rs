@@ -23,8 +23,14 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 /// Public model catalog; availability is evaluated when a response is requested.
 pub async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let cfg = app.config.read().await;
-    if headers.get("authorization").and_then(|h| h.to_str().ok())
-        != Some(&format!("Bearer {}", cfg.api_key))
+    if cfg
+        .authenticate(
+            headers
+                .get("authorization")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or(""),
+        )
+        .is_none()
     {
         return error(
             StatusCode::UNAUTHORIZED,
@@ -76,15 +82,21 @@ async fn responses_inner(
     let (parts, incoming) = request.into_parts();
     let headers = parts.headers;
     let cfg = app.config.read().await.clone();
-    if headers.get("authorization").and_then(|h| h.to_str().ok())
-        != Some(&format!("Bearer {}", cfg.api_key))
-    {
+    let identity = cfg.authenticate(
+        headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or(""),
+    );
+    if identity.is_none() {
         return error(
             StatusCode::UNAUTHORIZED,
             "invalid_api_key",
             "公司 API Key 不正确",
         );
     }
+    let (id, name) = identity.unwrap();
+    trace.client(id, name);
     trace.begin(&app.metrics);
     let mut body = Vec::new();
     let mut incoming = incoming.into_data_stream();
@@ -294,6 +306,9 @@ async fn responses_inner(
                     },
                 )
                 .await;
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                    trace.usage(crate::usage::Tokens::parse(&v["usage"]));
+                }
                 let classified = classify(status.as_u16(), &raw);
                 if classified == 400 {
                     return (status, [("content-type", "application/json")], raw).into_response();
@@ -360,6 +375,10 @@ async fn responses_inner(
                     continue;
                 }
                 let v = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+                trace.usage(
+                    v.as_ref()
+                        .and_then(|v| crate::usage::Tokens::parse(&v["usage"])),
+                );
                 if !v.as_ref().is_some_and(crate::errors::valid_response) {
                     let class = classify(status.as_u16(), &bytes);
                     trace.retry(crate::telemetry::failure_reason(class));
@@ -388,6 +407,7 @@ async fn responses_inner(
                     match tokio::time::timeout_at(first_deadline, source.next()).await {
                         Ok(Some(Ok(bytes))) => {
                             observer.feed(&bytes);
+                            trace.usage(observer.usage.take());
                             if observer.output_text {
                                 trace.first();
                             }
@@ -403,6 +423,7 @@ async fn responses_inner(
                         }
                         Ok(None) => {
                             observer.finish();
+                            trace.usage(observer.usage.take());
                             if observer.retryable_failure {
                                 early_failure = true;
                                 break;
@@ -451,10 +472,10 @@ async fn responses_inner(
                             for bytes in prefix {yield Ok::<Bytes,std::io::Error>(bytes);}
                             loop {
                                 match tokio::time::timeout(Duration::from_secs(600),source.next()).await {
-                                    Ok(Some(Ok(bytes)))=>{if is_sse {observer.feed(&bytes);if observer.output_text {trace.first();}
+                                    Ok(Some(Ok(bytes)))=>{if is_sse {observer.feed(&bytes); trace.usage(observer.usage.take());if observer.output_text {trace.first();}
             if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}}yield Ok::<Bytes,std::io::Error>(bytes);},
                                     Ok(None)=>{
-                                        observer.finish();
+                                        observer.finish(); trace.usage(observer.usage.take());
                                         if observer.failed {trace.result("failed", crate::telemetry::failure_reason(observer.failure_status.unwrap_or(503)));fail(&app2,&config2,&key_id,&channel_name,observer.failure_status.unwrap_or(503)).await;}
                                         else if !observer.terminal {trace.result("unknown", "unrecognized_terminal");protocol_warning(&app2,&config2,&key_id,&channel_name).await;}
                                         else {trace.result("success", "completed");record_success(&app2,&config2,&key_id).await;}

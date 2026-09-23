@@ -70,6 +70,8 @@ pub struct Observer {
     data_line: bool,
     previous_cr: bool,
     scanner: TypeScanner,
+    usage_scanner: crate::usage::Scanner,
+    pub usage: Option<crate::usage::Tokens>,
     pub terminal: bool,
     pub failed: bool,
     pub failure_status: Option<u16>,
@@ -116,6 +118,10 @@ impl Observer {
                 self.failure_status = Some(crate::errors::classify(503, &self.data));
             }
         }
+        if let Some(t) = self.usage_scanner.found.take() {
+            self.usage = Some(t);
+        }
+        self.usage_scanner = crate::usage::Scanner::default();
         self.scanner = TypeScanner::default();
         self.data.clear();
         self.overflow = false;
@@ -133,6 +139,7 @@ impl Observer {
             }
             if self.data_line {
                 self.scanner.byte(b'\n');
+                self.usage_scanner.byte(b'\n');
                 if self.line_size <= 65536 && self.data.len() + self.line.len() < 65536 {
                     self.data.extend_from_slice(&self.line[5..]);
                     self.data.push(b'\n');
@@ -165,6 +172,7 @@ impl Observer {
             }
             if self.data_line && self.line_size > 5 {
                 self.scanner.byte(b);
+                self.usage_scanner.byte(b);
             }
         }
     }

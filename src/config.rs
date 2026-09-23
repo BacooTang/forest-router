@@ -5,6 +5,8 @@ use std::collections::HashSet;
 pub struct Config {
     pub listen: String,
     pub api_key: String,
+    #[serde(default)]
+    pub employee_keys: Vec<EmployeeKey>,
     pub admin_password_hash: String,
     #[serde(default)]
     pub webhook: String,
@@ -113,7 +115,25 @@ pub struct Monitor {
 fn enabled_by_default() -> bool {
     true
 }
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EmployeeKey {
+    pub id: String,
+    pub name: String,
+    pub secret: String,
+    pub enabled: bool,
+}
 impl Config {
+    pub fn authenticate(&self, bearer: &str) -> Option<(String, String)> {
+        let secret = bearer.strip_prefix("Bearer ")?;
+        if secret == self.api_key {
+            return Some(("master".into(), "总 Key".into()));
+        }
+        self.employee_keys
+            .iter()
+            .find(|k| k.enabled && k.secret == secret)
+            .map(|k| (k.id.clone(), k.name.clone()))
+    }
+
     pub fn digest(&self) -> String {
         use sha2::{Digest, Sha256};
         format!(
@@ -123,6 +143,21 @@ impl Config {
     }
     pub fn validate(&self) -> Result<(), String> {
         validate_monitor_schedule(&self.monitor_schedule)?;
+        let mut ids = HashSet::from(["master".to_string()]);
+        let mut secrets = HashSet::from([self.api_key.clone()]);
+        for k in &self.employee_keys {
+            if k.id.is_empty()
+                || k.id.len() > 128
+                || k.name.trim().is_empty()
+                || k.name.len() > 256
+                || k.secret.len() < 32
+                || k.secret.len() > 4096
+                || !ids.insert(k.id.clone())
+                || !secrets.insert(k.secret.clone())
+            {
+                return Err("员工 Key 字段无效或重复".into());
+            }
+        }
         if self.api_key.is_empty() {
             return Err("公司 API Key 不能为空".into());
         }

@@ -24,6 +24,11 @@ class Upstream(http.server.BaseHTTPRequestHandler):
    self.send_response(503);self.send_header('Content-Length','0');self.end_headers();return
   if self.path.startswith('/early/'):
    out=b'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n';self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+  if self.path.startswith('/usage/'):
+   usage={'input_tokens':20,'output_tokens':3,'input_tokens_details':{'cached_tokens':10}}
+   value={'status':'completed','output':[],'pad':'x'*70000,'usage':usage}
+   out=(('data: '+json.dumps({'type':'response.completed','response':value})+'\n\n')*2).encode() if d.get('stream') else json.dumps(value).encode()
+   self.send_response(200);self.send_header('Content-Type','text/event-stream' if d.get('stream') else 'application/json');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
   if self.path.startswith('/review/'):
    name=self.path.split('/')[2];status=200;ct='text/event-stream'
    delta=b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
@@ -70,7 +75,7 @@ def main():
   opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
   def request(path,data=None,auth=False):
    h={'content-type':'application/json','x-forest-admin':'1'}
-   if auth:h['Authorization']='Bearer company-secret'
+   if auth:h['Authorization']='Bearer '+(auth if isinstance(auth,str) else 'company-secret')
    req=urllib.request.Request(base+path,data=None if data is None else json.dumps(data).encode(),headers=h)
    try:
     with opener.open(req,timeout=20) as r:
@@ -103,6 +108,21 @@ def main():
    cfg['monitor_schedule'][0]['interval_minutes']=5
    assert request('/admin/api/save',cfg)[0]==200
    def channel(i,path):return {'id':i,'name':i,'base_url':f'http://127.0.0.1:{up}/{path}/v1','upstream_model':'upstream-model','adapter':'sub2_api','enabled':True,'keys':[{'id':i+'-key','label':i,'secret':'upstream-secret'}]}
+   employee='fr_'+'a'*64
+   cfg['employee_keys']=[{'id':'employee-a','name':'测试员工','secret':employee,'enabled':True}]
+   cfg['models']=[{'id':'test-model','channels':[channel('usage','usage')]}]
+   assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/models',auth=employee)[0]==200
+   for stream in (True,False):
+    assert request('/v1/responses',{'model':'test-model','input':'hello','stream':stream},employee)[0]==200
+   ledger=json.loads(request('/admin/api/state')[1])['client_usage']['clients']['employee-a']
+   day=str(int((time.time()+28800)//86400));u=ledger['days'][day]
+   assert (u['requests'],u['input'],u['output'],u['cached'],u['missing'])==(2,40,6,20,0),u
+   cfg['employee_keys'][0]['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/models',auth=employee)[0]==401
+   assert request('/v1/responses',{'model':'test-model','input':'hello'},employee)[0]==401
+   cfg['employee_keys']=[];assert request('/admin/api/save',cfg)[0]==200
+   assert 'employee-a' in json.loads(request('/admin/api/state')[1])['client_usage']['clients']
    cfg['models']=[{'id':'test-model','channels':[channel('broken','bad'),channel('good','ok')]}]
    assert request('/admin/api/save',cfg)[0]==200
    status,catalog=request('/v1/models',auth=True);assert status==200

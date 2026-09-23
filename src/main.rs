@@ -13,6 +13,7 @@ mod state;
 mod storage;
 mod telemetry;
 mod upstream;
+mod usage;
 
 use app::App;
 use axum::{
@@ -93,6 +94,7 @@ async fn main() {
         let c = Config {
             listen: std::env::var("FOREST_LISTEN").unwrap_or_else(|_| "0.0.0.0:8119".into()),
             api_key,
+            employee_keys: vec![],
             admin_password_hash: hash,
             webhook: String::new(),
             notify_all_monitors: false,
