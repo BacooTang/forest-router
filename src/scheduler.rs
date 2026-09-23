@@ -97,10 +97,7 @@ pub fn spawn(app: Arc<App>) {
             let cfg = app.config.read().await.clone();
             let now = chrono::Utc::now().timestamp();
             let monitors = {
-                let mut state = app.state.lock().await;
-                for model in &cfg.models {
-                    state.route_order(model, now);
-                }
+                let state = app.state.lock().await;
                 cfg.monitors
                     .iter()
                     .filter(|m| {

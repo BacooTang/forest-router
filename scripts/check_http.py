@@ -128,8 +128,8 @@ def main():
    first['keys'][1]['enabled']=True;first['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
    assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/fallback/v1/responses'
    first['enabled']=True;assert request('/admin/api/save',cfg)[0]==200
-   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/fallback/v1/responses'
-   # A restored priority channel is held back, but disabling the active one bypasses the hold.
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/switches/v1/responses'
+   # Restored priority providers immediately take precedence.
    cfg['models'][0]['channels'][1]['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
    assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/switches/v1/responses'
    cfg['models'][0]['channels']=[channel('empty','empty'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
@@ -147,7 +147,15 @@ def main():
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==409
    worker.join();assert checks==[200];monitor_delay=0
    candy_answer='20';assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   before=len(seen)
    assert request('/v1/responses',payload,True)[0]==503
+   assert len(seen)==before
+   fallback=channel('quality-fallback','ok/quality-fallback')
+   cfg['models'][0]['channels'].append(fallback);assert request('/admin/api/save',cfg)[0]==200
+   before=len(seen)
+   assert request('/v1/responses',payload,True)[0]==200
+   assert len(seen)==before+1 and seen[-1][0]=='/ok/quality-fallback/v1/responses'
+   cfg['models'][0]['channels'].pop();assert request('/admin/api/save',cfg)[0]==200
    for _ in range(80):
     if hooks:break
     time.sleep(.1)
@@ -195,22 +203,24 @@ def main():
    before=len(seen);assert request('/v1/responses',payload,True)[0]==400;assert len(seen)==before+1
    cfg['models'][0]['channels']=[channel('duplicate1','bad'),channel('duplicate2','bad'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
    before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+2
+   cfg['models'][0]['channels']=[channel('big-input','ok')];assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',dict(payload,input='x'*(9*1024*1024)),True)[0]==200
    cfg['models'][0]['channels']=[channel('cap'+str(i),'bad/'+str(i)) for i in range(10)];assert request('/admin/api/save',cfg)[0]==200
-   before=len(seen);assert request('/v1/responses',payload,True)[0]==503;assert len(seen)==before+8
-   for name,expected in [('large',200),('alias',200),('unknownterminal',200),('together',200),('split',200),('silent',200),('huge',502),('input',400),('validation',422),('okextra',200)]:
+   before=len(seen);assert request('/v1/responses',payload,True)[0]==503;assert len(seen)==before+10
+   for name,expected in [('large',200),('alias',200),('unknownterminal',200),('together',200),('split',200),('silent',200),('huge',200),('input',400),('validation',422),('okextra',200)]:
     cfg['models'][0]['channels']=[channel('review-'+name,'review/'+name),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
     before=len(seen);status,body=request('/v1/responses',payload,True)
     assert status==expected,(name,status,body[:200]);assert len(seen)==before+1,(name,'request replayed')
     state=json.loads(request('/admin/api/state')[1])['state'];key=state['keys']['review-'+name+'-key']
     assert key['suspect']==(name in ('together','split')),(name,key)
     if name in ('large','alias','silent','okextra'):assert key['checked'],(name,'successful response not recorded')
-    if name in ('unknownterminal','together','split','huge','input','validation'):assert not key['checked'],(name,'failure recorded as success')
+    if name in ('unknownterminal','together','split','input','validation'):assert not key['checked'],(name,'failure recorded as success')
     if name=='large':assert b'P'*70000 in body
-    if name=='huge':assert b'response_too_large' in body
+    if name=='huge':assert len(body)>8*1024*1024
     if name in ('together','split'):assert b'hello' in body and b'response.failed' in body
     traffic=json.loads(request('/admin/api/state')[1])['traffic']
     assert traffic['active']==0,traffic
-    if name in ('together','split','unknownterminal','huge','input','validation'):
+    if name in ('together','split','unknownterminal','input','validation'):
      report=next(r for r in traffic['failures'] if r['id']==request.last_id)
      assert len(report['attempts'])==1
      assert report['outcome']==('unknown' if name=='unknownterminal' else 'failed')

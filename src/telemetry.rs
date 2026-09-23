@@ -176,14 +176,12 @@ impl Trace {
     pub fn attempt(&self, channel: &crate::config::Channel, key: &crate::config::Key) {
         let mut p = self.0.lock().unwrap();
         p.attempt_start = Instant::now();
-        if p.report.attempts.len() < 8 {
-            p.report.attempts.push(Attempt {
-                channel_id: channel.id.clone(),
-                channel: channel.name.clone(),
-                key_id: key.id.clone(),
-                ..Default::default()
-            });
-        }
+        p.report.attempts.push(Attempt {
+            channel_id: channel.id.clone(),
+            channel: channel.name.clone(),
+            key_id: key.id.clone(),
+            ..Default::default()
+        });
     }
     pub fn status(&self, status: u16) {
         let mut p = self.0.lock().unwrap();

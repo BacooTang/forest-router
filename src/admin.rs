@@ -95,17 +95,16 @@ pub async fn state(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
         .remove("admin_password_hash");
     config["_revision"] = json!(cfg.digest());
     let state = app.state.lock().await.clone();
-    let mut preview = state.clone();
     let routing: std::collections::HashMap<_, _> = cfg
         .models
         .iter()
         .map(|m| {
             let now = chrono::Utc::now().timestamp();
-            let order = preview.route_order(m, now);
-            let preferred = order
-                .into_iter()
-                .find(|i| preview.channel_ready(&m.channels[*i], now))
-                .map(|i| m.channels[i].id.clone());
+            let preferred = m
+                .channels
+                .iter()
+                .find(|c| state.channel_ready(c, now))
+                .map(|c| c.id.clone());
             (m.id.clone(), preferred)
         })
         .collect();
@@ -268,19 +267,6 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
             }
         }
         state.reconcile(&cfg);
-        for model in &cfg.models {
-            if old
-                .models
-                .iter()
-                .find(|m| m.id == model.id)
-                .is_none_or(|m| {
-                    m.channels.iter().map(|c| &c.id).collect::<Vec<_>>()
-                        != model.channels.iter().map(|c| &c.id).collect::<Vec<_>>()
-                })
-            {
-                state.sticky_routes.remove(&model.id);
-            }
-        }
         if old.monitor_schedule != cfg.monitor_schedule {
             let now = chrono::Utc::now().timestamp();
             for q in state.quality.values_mut() {
@@ -344,19 +330,6 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
         {
             let current = app.config.read().await;
             complete &= Arc::ptr_eq(&current, &cfg);
-            if complete {
-                let mut state = app.state.lock().await;
-                let now = chrono::Utc::now().timestamp();
-                let fresh_quality = c.monitor_id.as_ref().is_none_or(|id| {
-                    state
-                        .quality
-                        .get(id)
-                        .is_some_and(|q| q.verdict == "healthy" && q.valid_until > now)
-                });
-                if fresh_quality && state.channel_ready(c, now) {
-                    state.prefer_verified(model, now);
-                }
-            }
         }
         let _ = app.persist().await;
         if !complete {

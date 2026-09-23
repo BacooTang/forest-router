@@ -13,7 +13,6 @@ pub struct State {
     pub quality: HashMap<String, Quality>,
     pub events: VecDeque<Event>,
     pub last_used: HashMap<String, String>,
-    pub sticky_routes: HashMap<String, StickyRoute>,
     #[serde(skip)]
     pub round_robin: HashMap<String, usize>,
 }
@@ -54,13 +53,6 @@ pub struct Quality {
     pub valid_until: i64,
     pub next_at: i64,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StickyRoute {
-    pub channel_id: String,
-    pub recovered: HashMap<String, i64>,
-    pub revision: u64,
-}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
     pub at: i64,
@@ -90,64 +82,6 @@ impl State {
                     .get(id)
                     .is_some_and(|q| q.last_definite == "healthy" && q.valid_until > now)
             })
-    }
-    pub fn prefer_verified(&mut self, model: &crate::config::Model, now: i64) {
-        let Some(channel) = model.channels.iter().find(|c| self.channel_ready(c, now)) else {
-            return;
-        };
-        let revision = self.sticky_routes.get(&model.id).map_or(0, |r| r.revision);
-        self.sticky_routes.insert(
-            model.id.clone(),
-            StickyRoute {
-                channel_id: channel.id.clone(),
-                recovered: HashMap::new(),
-                revision: revision + 1,
-            },
-        );
-        self.event(
-            "route",
-            format!("{}：手动验证完成，按顺位选择 {}", model.id, channel.name),
-        );
-    }
-    pub fn route_order(&mut self, model: &crate::config::Model, now: i64) -> Vec<usize> {
-        let ready: Vec<bool> = model
-            .channels
-            .iter()
-            .map(|c| self.channel_ready(c, now))
-            .collect();
-        let mut order: Vec<usize> = (0..model.channels.len()).collect();
-        let Some(sticky) = self.sticky_routes.get_mut(&model.id) else {
-            return order;
-        };
-        let Some(active) = model
-            .channels
-            .iter()
-            .position(|c| c.id == sticky.channel_id)
-        else {
-            return order;
-        };
-        sticky
-            .recovered
-            .retain(|id, _| model.channels[..active].iter().any(|c| c.id == *id));
-        for (i, c) in model.channels[..active].iter().enumerate() {
-            if ready[i] {
-                sticky.recovered.entry(c.id.clone()).or_insert(now);
-            } else {
-                sticky.recovered.remove(&c.id);
-            }
-        }
-        let settled = (0..active).any(|i| {
-            ready[i]
-                && sticky
-                    .recovered
-                    .get(&model.channels[i].id)
-                    .is_some_and(|t| now - t >= 600)
-        });
-        if ready[active] && !settled {
-            order.remove(active);
-            order.insert(0, active);
-        }
-        order
     }
 }
 impl KeyState {
@@ -244,43 +178,30 @@ mod tests {
         assert!(!s.suspect);
     }
     #[test]
-    fn recovered_provider_waits_and_current_failure_bypasses_wait() {
-        let model:crate::config::Model=serde_json::from_value(serde_json::json!({"id":"m","channels":[
-            {"id":"a","name":"A","base_url":"http://localhost","upstream_model":"m","adapter":"auto","enabled":true,"keys":[{"id":"ka","label":"a","secret":"fixture"}]},
-            {"id":"b","name":"B","base_url":"http://localhost","upstream_model":"m","adapter":"auto","enabled":true,"keys":[{"id":"kb","label":"b","secret":"fixture"}]}]})).unwrap();
-        let mut state = State::default();
-        state.sticky_routes.insert(
-            "m".into(),
-            StickyRoute {
-                channel_id: "b".into(),
+    fn degraded_quality_excludes_all_keys_and_legacy_hold_is_ignored() {
+        let channel:crate::config::Channel=serde_json::from_value(serde_json::json!({"id":"a","name":"A","base_url":"http://localhost","upstream_model":"m","adapter":"auto","enabled":true,"monitor_id":"q","keys":[{"id":"k1","label":"1","secret":"fixture"},{"id":"k2","label":"2","secret":"fixture"}]})).unwrap();
+        let mut state:State=serde_json::from_value(serde_json::json!({"sticky_routes":{"m":{"channel_id":"b","recovered":{},"revision":1}}})).unwrap();
+        assert!(
+            !serde_json::to_value(&state)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("sticky_routes")
+        );
+        state.quality.insert(
+            "q".into(),
+            Quality {
+                verdict: "degraded".into(),
+                last_definite: "degraded".into(),
+                valid_until: 999,
                 ..Default::default()
             },
         );
-        state
-            .keys
-            .entry("ka".into())
-            .or_default()
-            .suspect_service(100);
-        assert_eq!(state.route_order(&model, 100), vec![1, 0]);
-        state.keys.get_mut("ka").unwrap().suspect = false;
-        assert_eq!(state.route_order(&model, 200), vec![1, 0]);
-        assert_eq!(state.route_order(&model, 799), vec![1, 0]);
-        let mut manual = state.clone();
-        let revision = manual.sticky_routes["m"].revision;
-        manual.prefer_verified(&model, 799);
-        assert_eq!(manual.route_order(&model, 799), vec![0, 1]);
-        assert!(manual.sticky_routes["m"].revision > revision);
-        assert!(manual.sticky_routes["m"].recovered.is_empty());
-        assert_eq!(state.route_order(&model, 800), vec![0, 1]);
-        state.keys.get_mut("ka").unwrap().suspect = true;
-        state.route_order(&model, 801);
-        state.keys.get_mut("ka").unwrap().suspect = false;
-        assert_eq!(state.route_order(&model, 900), vec![1, 0]);
-        state.keys.entry("kb".into()).or_default().credential_failed = true;
-        assert_eq!(state.route_order(&model, 901), vec![0, 1]);
-        let restored: State =
-            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-        assert_eq!(restored.sticky_routes["m"].recovered["a"], 900);
+        assert!(!state.channel_ready(&channel, 100));
+        state.quality.get_mut("q").unwrap().last_definite = "healthy".into();
+        state.quality.get_mut("q").unwrap().verdict = "healthy".into();
+        assert!(state.channel_ready(&channel, 100));
+        assert!(!state.channel_ready(&channel, 1000));
     }
     #[test]
     fn recovery_budget_stops_permanent_failures() {
@@ -416,11 +337,6 @@ impl State {
             c.models
                 .iter()
                 .any(|m| m.channels.iter().any(|c| c.id == *id))
-        });
-        self.sticky_routes.retain(|model, route| {
-            c.models
-                .iter()
-                .any(|m| m.id == *model && m.channels.iter().any(|ch| ch.id == route.channel_id))
         });
         self.events.truncate(200);
         self.notices.truncate(200);

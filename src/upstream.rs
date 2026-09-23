@@ -8,7 +8,7 @@ use std::time::Duration;
 pub fn client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(600))
         .pool_max_idle_per_host(2)
         .pool_idle_timeout(Duration::from_secs(30))
         .build()

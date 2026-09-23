@@ -86,27 +86,11 @@ async fn responses_inner(
         );
     }
     trace.begin(&app.metrics);
-    let permit = match app.requests.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", "当前并发已满"),
-    };
-    // Budget raw input, parsed values and rewritten body together (64MiB total).
-    let mut reservations = Vec::new();
     let mut body = Vec::new();
     let mut incoming = incoming.into_data_stream();
     let read = tokio::time::timeout(Duration::from_secs(600), async {
         while let Some(chunk) = incoming.next().await {
             let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
-            if body.len() + chunk.len() > 8 * 1024 * 1024 {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
-            }
-            let units = (3 * chunk.len()).div_ceil(1024) as u32;
-            reservations.push(
-                app.request_bytes
-                    .clone()
-                    .try_acquire_many_owned(units)
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
-            );
             body.extend_from_slice(&chunk);
         }
         Ok(())
@@ -115,12 +99,7 @@ async fn responses_inner(
     match read {
         Ok(Ok(())) => {}
         Ok(Err(status)) => {
-            let (code, message) = match status {
-                StatusCode::PAYLOAD_TOO_LARGE => ("request_too_large", "请求超过8MiB"),
-                StatusCode::SERVICE_UNAVAILABLE => ("request_budget", "请求内存预算已满"),
-                _ => ("request_read_error", "请求正文读取失败"),
-            };
-            return error(status, code, message);
+            return error(status, "request_read_error", "请求正文读取失败");
         }
         Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "body_timeout", "读取请求超时"),
     }
@@ -146,7 +125,7 @@ async fn responses_inner(
         return error(StatusCode::NOT_FOUND, "model_not_found", "模型未配置");
     };
     trace.model(&model);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     // External stored response identifiers are not portable across vendors.
     let pinned = payload
         .get("previous_response_id")
@@ -163,14 +142,7 @@ async fn responses_inner(
     }
 
     let mut attempted = std::collections::HashSet::new();
-    let (channel_order, route_revision) = {
-        let mut state = app.state.lock().await;
-        let order = state.route_order(route, chrono::Utc::now().timestamp());
-        let revision = state.sticky_routes.get(&model).map_or(0, |r| r.revision);
-        (order, revision)
-    };
-    'channels: for channel_index in channel_order {
-        let channel = &route.channels[channel_index];
+    'channels: for channel in &route.channels {
         if !channel.enabled {
             continue;
         }
@@ -199,7 +171,7 @@ async fn responses_inner(
         };
         for offset in 0..keys.len() {
             let key = &channel.keys[keys[(start + offset) % keys.len()]];
-            if tokio::time::Instant::now() >= deadline || attempted.len() >= 8 {
+            if tokio::time::Instant::now() >= deadline {
                 break 'channels;
             }
             // A repeated configuration of the same credential/model is one candidate.
@@ -227,16 +199,17 @@ async fn responses_inner(
             if !enabled {
                 continue;
             }
-            // Concurrent requests may have marked this key bad since candidate selection.
-            if app
-                .state
-                .lock()
-                .await
-                .keys
-                .get(&key.id)
-                .is_some_and(|s| !s.eligible(chrono::Utc::now().timestamp()))
+            // Recheck quality before every attempt, including retries within one provider.
+            // A newly degraded monitor excludes the entire linked provider.
             {
-                continue;
+                let state = app.state.lock().await;
+                let now = chrono::Utc::now().timestamp();
+                if !state.channel_ready(channel, now) {
+                    continue 'channels;
+                }
+                if state.keys.get(&key.id).is_some_and(|s| !s.eligible(now)) {
+                    continue;
+                }
             }
 
             let Ok(raw) = serde_json::value::to_raw_value(&channel.upstream_model) else {
@@ -288,7 +261,7 @@ async fn responses_inner(
             }
             trace.attempt(channel, key);
             let result = tokio::time::timeout_at(
-                deadline.min(tokio::time::Instant::now() + Duration::from_secs(30)),
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(600)),
                 request.send(),
             )
             .await;
@@ -313,12 +286,9 @@ async fn responses_inner(
                 let mut raw = Vec::new();
                 let mut source = response.bytes_stream();
                 let _ = tokio::time::timeout_at(
-                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(3)),
+                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(600)),
                     async {
                         while let Some(Ok(b)) = source.next().await {
-                            if raw.len() + b.len() > 65536 {
-                                break;
-                            }
                             raw.extend_from_slice(&b);
                         }
                     },
@@ -373,41 +343,17 @@ async fn responses_inner(
             if !is_sse {
                 let mut source = response.bytes_stream();
                 let mut bytes = Vec::new();
-                let mut budget = Vec::new();
                 let collected = tokio::time::timeout_at(
-                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(30)),
+                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(600)),
                     async {
                         while let Some(chunk) = source.next().await {
                             let chunk = chunk.map_err(|_| 503u16)?;
-                            if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
-                                return Err(530);
-                            }
-                            budget.push(
-                                app.request_bytes
-                                    .clone()
-                                    .try_acquire_many_owned((3 * chunk.len()).div_ceil(1024) as u32)
-                                    .map_err(|_| 529u16)?,
-                            );
                             bytes.extend_from_slice(&chunk);
                         }
                         Ok::<(), u16>(())
                     },
                 )
                 .await;
-                if matches!(collected, Ok(Err(530))) {
-                    return error(
-                        StatusCode::BAD_GATEWAY,
-                        "response_too_large",
-                        "上游响应超过网关8MiB限制；请求未重放，渠道未标记故障",
-                    );
-                }
-                if matches!(collected, Ok(Err(529))) {
-                    return error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "response_budget",
-                        "响应内存预算已满",
-                    );
-                }
                 if !matches!(collected, Ok(Ok(()))) {
                     trace.retry("upstream_body_error");
                     fail(&app, &cfg, &key.id, &channel.name, 503).await;
@@ -423,16 +369,9 @@ async fn responses_inner(
                 trace.first();
                 trace.result("success", "completed");
                 record_success(&app, &cfg, &key.id).await;
-                record_route(
-                    &app,
-                    &cfg,
-                    &model,
-                    &channel.id,
-                    &channel.name,
-                    route_revision,
-                )
-                .await;
-                let output = async_stream::stream! {let _permit=permit;let _budget=budget;yield Ok::<Bytes,std::io::Error>(Bytes::from(bytes));};
+                record_route(&app, &cfg, &model, &channel.id, &channel.name).await;
+                let output =
+                    async_stream::stream! {yield Ok::<Bytes,std::io::Error>(Bytes::from(bytes));};
                 return builder.body(Body::from_stream(output)).unwrap_or_else(|_| {
                     error(StatusCode::BAD_GATEWAY, "response_error", "响应构造失败")
                 });
@@ -501,25 +440,17 @@ async fn responses_inner(
                 .await;
                 continue;
             }
-            record_route(
-                &app,
-                &cfg,
-                &model,
-                &channel.id,
-                &channel.name,
-                route_revision,
-            )
-            .await;
+            record_route(&app, &cfg, &model, &channel.id, &channel.name).await;
             let app2 = app.clone();
             let config2 = cfg.clone();
             let key_id = key.id.clone();
             let channel_name = channel.name.clone();
             let stream = async_stream::stream! {
-                            let _permit=permit;
+
                             if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}
                             for bytes in prefix {yield Ok::<Bytes,std::io::Error>(bytes);}
                             loop {
-                                match tokio::time::timeout(Duration::from_secs(120),source.next()).await {
+                                match tokio::time::timeout(Duration::from_secs(600),source.next()).await {
                                     Ok(Some(Ok(bytes)))=>{if is_sse {observer.feed(&bytes);if observer.output_text {trace.first();}
             if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}}yield Ok::<Bytes,std::io::Error>(bytes);},
                                     Ok(None)=>{
@@ -569,57 +500,27 @@ async fn record_success(app: &App, cfg: &Arc<config::Config>, id: &str) {
     let key = state.keys.entry(id.to_owned()).or_default();
     key.checked = true;
 }
-async fn record_route(
-    app: &App,
-    cfg: &Arc<config::Config>,
-    model: &str,
-    id: &str,
-    name: &str,
-    revision: u64,
-) {
+async fn record_route(app: &App, cfg: &Arc<config::Config>, model: &str, id: &str, name: &str) {
     let current = app.config.read().await;
     if !Arc::ptr_eq(&current, cfg) {
         return;
     }
     let mut state = app.state.lock().await;
-    state.last_used.insert(model.into(), id.into());
-    // A late response from an older selection must not move the active route back.
-    let old = state.sticky_routes.get(model);
-    if old.map_or(0, |r| r.revision) != revision {
-        return;
-    }
-    if old.is_none_or(|r| r.channel_id != id) {
-        let previous = old.map(|r| r.channel_id.clone());
+    let previous = state.last_used.insert(model.into(), id.into());
+    if previous.as_deref() != Some(id) {
         let returning = previous.as_ref().is_some_and(|old| {
             cfg.models.iter().find(|m| m.id == model).is_some_and(|m| {
                 m.channels.iter().position(|c| c.id == id)
                     < m.channels.iter().position(|c| c.id == *old)
             })
         });
-        state.sticky_routes.insert(
-            model.into(),
-            crate::state::StickyRoute {
-                channel_id: id.into(),
-                recovered: Default::default(),
-                revision: revision + 1,
-            },
-        );
         if previous.is_some() {
             app.metrics.lock().unwrap().route_switch(returning);
         }
-        state.event(
-            "route",
-            format!(
-                "{model} → {name}{}",
-                if returning {
-                    "（高优先级渠道恢复回切／当前渠道不可用兜底）"
-                } else {
-                    "（优先级选择／故障切换）"
-                }
-            ),
-        );
+        state.event("route", format!("{model} → {name}（按优先级选择）"));
     }
 }
+
 async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, status: u16) {
     let cfg = app.config.read().await;
     if !Arc::ptr_eq(&cfg, expected) {

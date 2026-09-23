@@ -124,8 +124,6 @@ async fn main() {
         config: RwLock::new(Arc::new(cfg.clone())),
         state: Mutex::new(state),
         client: upstream::client().expect("http client"),
-        requests: Arc::new(Semaphore::new(128)),
-        request_bytes: Arc::new(Semaphore::new(65536)),
         admin_requests: Arc::new(Semaphore::new(8)),
         checks: Arc::new(Semaphore::new(4)),
         login_slots: Arc::new(Semaphore::new(1)),

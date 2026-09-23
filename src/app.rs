@@ -12,8 +12,6 @@ pub struct App {
     pub config: RwLock<Arc<Config>>,
     pub state: Mutex<State>,
     pub client: reqwest::Client,
-    pub requests: Arc<Semaphore>,
-    pub request_bytes: Arc<Semaphore>,
     pub admin_requests: Arc<Semaphore>,
     pub checks: Arc<Semaphore>,
     pub login_slots: Arc<Semaphore>,
