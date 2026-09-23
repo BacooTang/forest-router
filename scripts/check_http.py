@@ -6,6 +6,7 @@ seen=[]
 hooks=[]
 candy_answer="21"
 monitor_delay=0
+transient_fail=False
 probe_throttled=False
 monitor_started=threading.Event()
 class Upstream(http.server.BaseHTTPRequestHandler):
@@ -19,6 +20,8 @@ class Upstream(http.server.BaseHTTPRequestHandler):
   if self.path.endswith('/chat/completions'):
    monitor_started.set();time.sleep(monitor_delay)
    out=json.dumps({'choices':[{'message':{'content':candy_answer},'finish_reason':'stop'}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+  if self.path.startswith('/transient/') and transient_fail and d.get('input')!='Reply OK.':
+   self.send_response(503);self.send_header('Content-Length','0');self.end_headers();return
   if self.path.startswith('/early/'):
    out=b'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n';self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
   if self.path.startswith('/review/'):
@@ -59,7 +62,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
 def freeport():
  s=socket.socket();s.bind(('127.0.0.1',0));p=s.getsockname()[1];s.close();return p
 def main():
- global candy_answer,monitor_delay,probe_throttled
+ global candy_answer,monitor_delay,probe_throttled,transient_fail
  server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream);threading.Thread(target=server.serve_forever,daemon=True).start();up=server.server_port
  with tempfile.TemporaryDirectory(prefix='forest-check-') as temp:
   port=freeport();base=f'http://127.0.0.1:{port}';env=dict(os.environ,FOREST_ROUTER_HOME=temp,FOREST_LISTEN=f'127.0.0.1:{port}',FOREST_ADMIN_PASSWORD='test-password',FOREST_API_KEY='company-secret')
@@ -111,7 +114,7 @@ def main():
    assert seen[-2][0]=='/bad/v1/responses' and seen[-1][0]=='/ok/v1/responses'
    assert seen[-1][2]==dict(payload,model='upstream-model')
    assert seen[-1][1].get('authorization')=='Bearer upstream-secret'
-   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['broken-key']['service_failed'];assert state['last_used']['test-model']=='good';assert state['keys']['good-key']['checked']
+   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['broken-key']['suspect'];assert state['last_used']['test-model']=='good';assert state['keys']['good-key']['checked']
    before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1
    assert request('/v1/responses',dict(payload,model='missing'),True)[0]==404
    assert request('/v1/responses',dict(payload,previous_response_id='private'),True)[0]==400
@@ -125,6 +128,9 @@ def main():
    first['keys'][1]['enabled']=True;first['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
    assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/fallback/v1/responses'
    first['enabled']=True;assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/fallback/v1/responses'
+   # A restored priority channel is held back, but disabling the active one bypasses the hold.
+   cfg['models'][0]['channels'][1]['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
    assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/switches/v1/responses'
    cfg['models'][0]['channels']=[channel('empty','empty'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
    assert request('/v1/responses',payload,True)[0]==200
@@ -164,7 +170,21 @@ def main():
     assert 'monitor-key' not in json.dumps(card)
    cfg['notify_all_monitors']=False;assert request('/admin/api/save',cfg)[0]==200
    cfg['webhook']=''
-   for prefix,flag in [('jsonauth','credential_failed'),('unknown','service_failed')]:
+   cfg['models'][0]['channels']=[channel('transient','transient'),channel('standby','ok/standby')];assert request('/admin/api/save',cfg)[0]==200
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/transient/v1/responses'
+   transient_fail=True
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/standby/v1/responses'
+   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['transient-key']['suspect'] and not state['keys']['transient-key']['service_failed']
+   assert request('/admin/api/verify',{'channel_id':'transient'})[0]==200
+   state=json.loads(request('/admin/api/state')[1])['state'];assert not state['keys']['transient-key']['suspect']
+   assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/ok/standby/v1/responses'
+   cfg['models'][0]['channels'][1]['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
+   # A second business failure after successful tiny probe must escalate.
+   assert request('/v1/responses',payload,True)[0]==503
+   assert json.loads(request('/admin/api/state')[1])['state']['keys']['transient-key']['service_failed']
+   transient_fail=False
+
+   for prefix,flag in [('jsonauth','credential_failed'),('unknown','suspect')]:
     cfg['models'][0]['channels']=[channel(prefix,prefix),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
     status,body=request('/v1/responses',payload,True);assert status==200 and b'response.completed' in body
     state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys'][prefix+'-key'][flag]
@@ -180,7 +200,7 @@ def main():
     before=len(seen);status,body=request('/v1/responses',payload,True)
     assert status==expected,(name,status,body[:200]);assert len(seen)==before+1,(name,'request replayed')
     state=json.loads(request('/admin/api/state')[1])['state'];key=state['keys']['review-'+name+'-key']
-    assert key['service_failed']==(name in ('together','split')),(name,key)
+    assert key['suspect']==(name in ('together','split')),(name,key)
     if name in ('large','alias','silent','okextra'):assert key['checked'],(name,'successful response not recorded')
     if name in ('unknownterminal','together','split','huge','input','validation'):assert not key['checked'],(name,'failure recorded as success')
     if name=='large':assert b'P'*70000 in body
@@ -204,7 +224,7 @@ def main():
    assert request('/v1/responses',payload,True)[0]==503
    before=len(seen);cfg['models'][0]['id']='renamed-model';assert request('/admin/api/save',cfg)[0]==200
    assert len(seen)==before
-   assert json.loads(request('/admin/api/state')[1])['state']['keys']['allbad-key']['service_failed']
+   assert json.loads(request('/admin/api/state')[1])['state']['keys']['allbad-key']['suspect']
    cfg['models'][0]['id']='test-model';assert request('/admin/api/save',cfg)[0]==200
    assert len(json.loads(request('/admin/api/state')[1])['state']['events'])<=200
    # Persisted failures survive graceful restart; manual reset requires actual success.

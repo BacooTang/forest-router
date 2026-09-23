@@ -15,6 +15,10 @@ pub struct Counts {
     pub cancelled: u64,
     pub unknown: u64,
     pub switches: u64,
+    pub key_switches: u64,
+    pub provider_switches: u64,
+    pub route_switches: u64,
+    pub returns: u64,
     pub first_ms_total: u64,
     pub first_samples: u64,
 }
@@ -76,6 +80,11 @@ impl Metrics {
             .retain(|b| b.minute > minute - 60 && b.minute <= minute);
         self.hours.truncate(60);
         self.failures.truncate(200);
+    }
+    pub fn route_switch(&mut self, returning: bool) {
+        self.roll(chrono::Utc::now().timestamp());
+        self.today.route_switches += 1;
+        self.today.returns += u64::from(returning);
     }
     pub fn snapshot(&mut self) -> Self {
         self.roll(chrono::Utc::now().timestamp());
@@ -260,6 +269,13 @@ impl Guard {
         if (r.at + 8 * 3600).div_euclid(86400) == m.day {
             m.today.result(&r.outcome, r.first_ms);
             m.today.switches += r.attempts.len().saturating_sub(1) as u64;
+            for pair in r.attempts.windows(2) {
+                if pair[0].channel_id == pair[1].channel_id {
+                    m.today.key_switches += 1;
+                } else {
+                    m.today.provider_switches += 1;
+                }
+            }
         }
         if m.hours
             .back()

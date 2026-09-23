@@ -78,11 +78,13 @@ pub async fn check(
         return false;
     }
     let failed_before = s.service_failed;
+    let suspect_before = s.suspect;
     if manual {
         s.probe_exhausted = false;
         s.probe_attempts = 0;
     }
     if reset {
+        s.last_incident = None;
         s.cooldown_until = 0;
         s.failure_cycles.clear();
         s.recovery_successes = 1;
@@ -104,6 +106,7 @@ pub async fn check(
         if s.service_failed {
             s.probe_result(now, true);
         } else {
+            s.suspect = false;
             s.retry_at = 0;
             s.reason.clear();
             s.revision += 1;
@@ -119,7 +122,7 @@ pub async fn check(
         false
     };
     let exhausted = s.probe_exhausted;
-    let recovered = failed_before && !s.service_failed;
+    let recovered = (failed_before || suspect_before) && !s.service_failed && !s.suspect;
     if exhausted {
         state.event(
             "service",

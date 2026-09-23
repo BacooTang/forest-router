@@ -13,6 +13,7 @@ pub struct State {
     pub quality: HashMap<String, Quality>,
     pub events: VecDeque<Event>,
     pub last_used: HashMap<String, String>,
+    pub sticky_routes: HashMap<String, StickyRoute>,
     #[serde(skip)]
     pub round_robin: HashMap<String, usize>,
 }
@@ -27,6 +28,8 @@ pub struct KeyState {
     pub balance_checked: i64,
     pub balance_error: Option<String>,
     pub service_failed: bool,
+    pub suspect: bool,
+    pub last_incident: Option<i64>,
     pub credential_failed: bool,
     pub cooldown_until: i64,
     pub retry_at: i64,
@@ -51,6 +54,13 @@ pub struct Quality {
     pub valid_until: i64,
     pub next_at: i64,
 }
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StickyRoute {
+    pub channel_id: String,
+    pub recovered: HashMap<String, i64>,
+    pub revision: u64,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
     pub at: i64,
@@ -69,16 +79,85 @@ impl State {
         });
     }
 }
+impl State {
+    pub fn channel_ready(&self, c: &crate::config::Channel, now: i64) -> bool {
+        c.enabled
+            && c.keys
+                .iter()
+                .any(|k| k.enabled && self.keys.get(&k.id).is_none_or(|s| s.eligible(now)))
+            && c.monitor_id.as_ref().is_none_or(|id| {
+                self.quality
+                    .get(id)
+                    .is_some_and(|q| q.last_definite == "healthy" && q.valid_until > now)
+            })
+    }
+    pub fn route_order(&mut self, model: &crate::config::Model, now: i64) -> Vec<usize> {
+        let ready: Vec<bool> = model
+            .channels
+            .iter()
+            .map(|c| self.channel_ready(c, now))
+            .collect();
+        let mut order: Vec<usize> = (0..model.channels.len()).collect();
+        let Some(sticky) = self.sticky_routes.get_mut(&model.id) else {
+            return order;
+        };
+        let Some(active) = model
+            .channels
+            .iter()
+            .position(|c| c.id == sticky.channel_id)
+        else {
+            return order;
+        };
+        sticky
+            .recovered
+            .retain(|id, _| model.channels[..active].iter().any(|c| c.id == *id));
+        for (i, c) in model.channels[..active].iter().enumerate() {
+            if ready[i] {
+                sticky.recovered.entry(c.id.clone()).or_insert(now);
+            } else {
+                sticky.recovered.remove(&c.id);
+            }
+        }
+        let settled = (0..active).any(|i| {
+            ready[i]
+                && sticky
+                    .recovered
+                    .get(&model.channels[i].id)
+                    .is_some_and(|t| now - t >= 600)
+        });
+        if ready[active] && !settled {
+            order.remove(active);
+            order.insert(0, active);
+        }
+        order
+    }
+}
 impl KeyState {
     pub fn eligible(&self, now: i64) -> bool {
-        !self.probe_exhausted
+        !self.suspect
+            && !self.probe_exhausted
             && !self.service_failed
             && !self.credential_failed
             && self.cooldown_until <= now
             && self.retry_at <= now
             && !self.allowance.as_ref().is_some_and(|a| a.unavailable(now))
     }
+    /// Multiple in-flight failures during the same incident do not escalate it.
+    pub fn suspect_service(&mut self, now: i64) -> bool {
+        if self.suspect || self.service_failed {
+            return false;
+        }
+        if self.last_incident.is_some_and(|t| now - t < 600) {
+            return self.fail_service(now);
+        }
+        self.last_incident = Some(now);
+        self.suspect = true;
+        self.retry_at = now + 5;
+        self.revision += 1;
+        false
+    }
     pub fn fail_service(&mut self, now: i64) -> bool {
+        self.suspect = false;
         let transition = !self.service_failed;
         if transition {
             self.failure_cycles.retain(|t| now - *t < 600);
@@ -135,6 +214,55 @@ impl KeyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_incident_confirmation_and_parallel_failures() {
+        let mut s = KeyState::default();
+        assert!(!s.suspect_service(100));
+        assert!(s.suspect);
+        assert!(!s.service_failed);
+        let rev = s.revision;
+        assert!(!s.suspect_service(101));
+        assert_eq!(s.revision, rev);
+        assert!(!s.eligible(1000));
+        s.suspect = false;
+        s.retry_at = 0;
+        assert!(s.suspect_service(150));
+        assert!(s.service_failed);
+        assert!(!s.suspect);
+    }
+    #[test]
+    fn recovered_provider_waits_and_current_failure_bypasses_wait() {
+        let model:crate::config::Model=serde_json::from_value(serde_json::json!({"id":"m","channels":[
+            {"id":"a","name":"A","base_url":"http://localhost","upstream_model":"m","adapter":"auto","enabled":true,"keys":[{"id":"ka","label":"a","secret":"fixture"}]},
+            {"id":"b","name":"B","base_url":"http://localhost","upstream_model":"m","adapter":"auto","enabled":true,"keys":[{"id":"kb","label":"b","secret":"fixture"}]}]})).unwrap();
+        let mut state = State::default();
+        state.sticky_routes.insert(
+            "m".into(),
+            StickyRoute {
+                channel_id: "b".into(),
+                ..Default::default()
+            },
+        );
+        state
+            .keys
+            .entry("ka".into())
+            .or_default()
+            .suspect_service(100);
+        assert_eq!(state.route_order(&model, 100), vec![1, 0]);
+        state.keys.get_mut("ka").unwrap().suspect = false;
+        assert_eq!(state.route_order(&model, 200), vec![1, 0]);
+        assert_eq!(state.route_order(&model, 799), vec![1, 0]);
+        assert_eq!(state.route_order(&model, 800), vec![0, 1]);
+        state.keys.get_mut("ka").unwrap().suspect = true;
+        state.route_order(&model, 801);
+        state.keys.get_mut("ka").unwrap().suspect = false;
+        assert_eq!(state.route_order(&model, 900), vec![1, 0]);
+        state.keys.entry("kb".into()).or_default().credential_failed = true;
+        assert_eq!(state.route_order(&model, 901), vec![0, 1]);
+        let restored: State =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(restored.sticky_routes["m"].recovered["a"], 900);
+    }
     #[test]
     fn recovery_budget_stops_permanent_failures() {
         let mut s = KeyState::default();
@@ -274,6 +402,11 @@ impl State {
             c.models
                 .iter()
                 .any(|m| m.channels.iter().any(|c| c.id == *id))
+        });
+        self.sticky_routes.retain(|model, route| {
+            c.models
+                .iter()
+                .any(|m| m.id == *model && m.channels.iter().any(|ch| ch.id == route.channel_id))
         });
         self.events.truncate(200);
         self.notices.truncate(200);

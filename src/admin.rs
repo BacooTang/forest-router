@@ -95,9 +95,23 @@ pub async fn state(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
         .remove("admin_password_hash");
     config["_revision"] = json!(cfg.digest());
     let state = app.state.lock().await.clone();
+    let mut preview = state.clone();
+    let routing: std::collections::HashMap<_, _> = cfg
+        .models
+        .iter()
+        .map(|m| {
+            let now = chrono::Utc::now().timestamp();
+            let order = preview.route_order(m, now);
+            let preferred = order
+                .into_iter()
+                .find(|i| preview.channel_ready(&m.channels[*i], now))
+                .map(|i| m.channels[i].id.clone());
+            (m.id.clone(), preferred)
+        })
+        .collect();
     (
         [("cache-control", "no-store")],
-        Json(json!({"config":config,"state":state,"traffic":app.metrics.lock().unwrap().view()})),
+        Json(json!({"config":config,"state":state,"routing":routing,"traffic":app.metrics.lock().unwrap().view()})),
     )
         .into_response()
 }
@@ -254,6 +268,19 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
             }
         }
         state.reconcile(&cfg);
+        for model in &cfg.models {
+            if old
+                .models
+                .iter()
+                .find(|m| m.id == model.id)
+                .is_none_or(|m| {
+                    m.channels.iter().map(|c| &c.id).collect::<Vec<_>>()
+                        != model.channels.iter().map(|c| &c.id).collect::<Vec<_>>()
+                })
+            {
+                state.sticky_routes.remove(&model.id);
+            }
+        }
         if old.monitor_schedule != cfg.monitor_schedule {
             let now = chrono::Utc::now().timestamp();
             for q in state.quality.values_mut() {

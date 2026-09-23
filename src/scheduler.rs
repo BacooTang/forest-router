@@ -66,7 +66,7 @@ pub fn spawn(app: Arc<App>) {
                                 .filter(|k| k.enabled)
                                 .filter(|k| {
                                     state.keys.get(&k.id).is_some_and(|s| {
-                                        s.service_failed
+                                        (s.service_failed || s.suspect)
                                             && !s.probe_exhausted
                                             && s.retry_at <= now
                                             && !s.allowance.as_ref().is_some_and(|a| a.exhausted)
@@ -97,7 +97,10 @@ pub fn spawn(app: Arc<App>) {
             let cfg = app.config.read().await.clone();
             let now = chrono::Utc::now().timestamp();
             let monitors = {
-                let state = app.state.lock().await;
+                let mut state = app.state.lock().await;
+                for model in &cfg.models {
+                    state.route_order(model, now);
+                }
                 cfg.monitors
                     .iter()
                     .filter(|m| {

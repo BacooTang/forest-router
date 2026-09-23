@@ -94,7 +94,7 @@ async fn responses_inner(
     let mut reservations = Vec::new();
     let mut body = Vec::new();
     let mut incoming = incoming.into_data_stream();
-    let read = tokio::time::timeout(Duration::from_secs(30), async {
+    let read = tokio::time::timeout(Duration::from_secs(600), async {
         while let Some(chunk) = incoming.next().await {
             let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
             if body.len() + chunk.len() > 8 * 1024 * 1024 {
@@ -163,7 +163,14 @@ async fn responses_inner(
     }
 
     let mut attempted = std::collections::HashSet::new();
-    'channels: for channel in &route.channels {
+    let (channel_order, route_revision) = {
+        let mut state = app.state.lock().await;
+        let order = state.route_order(route, chrono::Utc::now().timestamp());
+        let revision = state.sticky_routes.get(&model).map_or(0, |r| r.revision);
+        (order, revision)
+    };
+    'channels: for channel_index in channel_order {
+        let channel = &route.channels[channel_index];
         if !channel.enabled {
             continue;
         }
@@ -416,7 +423,15 @@ async fn responses_inner(
                 trace.first();
                 trace.result("success", "completed");
                 record_success(&app, &cfg, &key.id).await;
-                record_route(&app, &cfg, &model, &channel.id, &channel.name).await;
+                record_route(
+                    &app,
+                    &cfg,
+                    &model,
+                    &channel.id,
+                    &channel.name,
+                    route_revision,
+                )
+                .await;
                 let output = async_stream::stream! {let _permit=permit;let _budget=budget;yield Ok::<Bytes,std::io::Error>(Bytes::from(bytes));};
                 return builder.body(Body::from_stream(output)).unwrap_or_else(|_| {
                     error(StatusCode::BAD_GATEWAY, "response_error", "响应构造失败")
@@ -486,7 +501,15 @@ async fn responses_inner(
                 .await;
                 continue;
             }
-            record_route(&app, &cfg, &model, &channel.id, &channel.name).await;
+            record_route(
+                &app,
+                &cfg,
+                &model,
+                &channel.id,
+                &channel.name,
+                route_revision,
+            )
+            .await;
             let app2 = app.clone();
             let config2 = cfg.clone();
             let key_id = key.id.clone();
@@ -546,15 +569,55 @@ async fn record_success(app: &App, cfg: &Arc<config::Config>, id: &str) {
     let key = state.keys.entry(id.to_owned()).or_default();
     key.checked = true;
 }
-async fn record_route(app: &App, cfg: &Arc<config::Config>, model: &str, id: &str, name: &str) {
+async fn record_route(
+    app: &App,
+    cfg: &Arc<config::Config>,
+    model: &str,
+    id: &str,
+    name: &str,
+    revision: u64,
+) {
     let current = app.config.read().await;
     if !Arc::ptr_eq(&current, cfg) {
         return;
     }
     let mut state = app.state.lock().await;
-    let previous = state.last_used.insert(model.into(), id.into());
-    if previous.as_deref() != Some(id) {
-        state.event("route", format!("{model} → {name}"));
+    state.last_used.insert(model.into(), id.into());
+    // A late response from an older selection must not move the active route back.
+    let old = state.sticky_routes.get(model);
+    if old.map_or(0, |r| r.revision) != revision {
+        return;
+    }
+    if old.is_none_or(|r| r.channel_id != id) {
+        let previous = old.map(|r| r.channel_id.clone());
+        let returning = previous.as_ref().is_some_and(|old| {
+            cfg.models.iter().find(|m| m.id == model).is_some_and(|m| {
+                m.channels.iter().position(|c| c.id == id)
+                    < m.channels.iter().position(|c| c.id == *old)
+            })
+        });
+        state.sticky_routes.insert(
+            model.into(),
+            crate::state::StickyRoute {
+                channel_id: id.into(),
+                recovered: Default::default(),
+                revision: revision + 1,
+            },
+        );
+        if previous.is_some() {
+            app.metrics.lock().unwrap().route_switch(returning);
+        }
+        state.event(
+            "route",
+            format!(
+                "{model} → {name}{}",
+                if returning {
+                    "（高优先级渠道恢复回切／当前渠道不可用兜底）"
+                } else {
+                    "（优先级选择／故障切换）"
+                }
+            ),
+        );
     }
 }
 async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, status: u16) {
@@ -577,6 +640,7 @@ async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, s
         .keys
         .entry(id.to_owned())
         .or_insert_with(KeyState::default);
+    let was_suspect = s.suspect;
     let (changed, kind) = match status {
         401 => {
             let changed = !s.credential_failed;
@@ -599,16 +663,23 @@ async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, s
             s.revision += 1;
             (changed, "rate_limit")
         }
-        _ => (s.fail_service(now), "service"),
+        _ => (s.suspect_service(now), "service"),
     };
-    s.reason = match status {
-        401 => "凭证失效",
-        402 => "额度耗尽",
-        429 => "上游限流，暂时跳过",
-        0 => "连接失败或流中断",
-        _ => "上游服务或未知协议错误，暂停路由并受限探测",
+    s.reason = if s.suspect {
+        "暂时异常，等待快速确认"
+    } else {
+        match status {
+            401 => "凭证失效",
+            402 => "额度耗尽",
+            429 => "上游限流，暂时跳过",
+            0 => "连接失败或流中断",
+            _ => "上游服务或未知协议错误，暂停路由并受限探测",
+        }
     }
     .into();
+    if s.suspect && !was_suspect {
+        state.event("service", format!("{name} / {id}：暂时异常，等待快速确认"));
+    }
     if changed && matches!(kind, "balance" | "service") && !cfg.webhook.is_empty() {
         state.notify(format!(
             "{} / {}：{}",
