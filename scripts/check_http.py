@@ -248,6 +248,7 @@ def main():
    assert key['probe_attempts']==4 and key['retry_at']>now and key['service_failed'],key
    probe_throttled=False
    assert request('/admin/api/verify',{'channel_id':'recover','reset':True})[0]==200
+   unlocked=json.loads(request('/admin/api/state')[1])['state']['keys']['recover-key'];assert unlocked['cooldown_until']==0 and not unlocked['service_failed']
    assert request('/v1/responses',payload,True)[0]==200
 
    cfg=json.loads(request('/admin/api/state')[1])['config'];cfg['new_password']='changed-password';assert request('/admin/api/save',cfg)[0]==200

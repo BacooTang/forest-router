@@ -102,6 +102,21 @@ pub async fn check(
         }
         return true;
     }
+    if manual && ok {
+        // Manual verification is an explicit operator decision: unlock immediately.
+        s.suspect = false;
+        s.service_failed = false;
+        s.cooldown_until = 0;
+        s.probe_exhausted = false;
+        s.probe_attempts = 0;
+        s.probe_step = 0;
+        s.recovery_successes = 0;
+        s.retry_at = 0;
+        s.reason.clear();
+        s.checked = true;
+        s.credential_failed = false;
+        s.revision += 1;
+    }
     let new_failure = if ok {
         if s.service_failed {
             s.probe_result(now, true);

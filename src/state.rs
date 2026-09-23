@@ -138,7 +138,6 @@ impl KeyState {
             && !self.probe_exhausted
             && !self.service_failed
             && !self.credential_failed
-            && self.cooldown_until <= now
             && self.retry_at <= now
             && !self.allowance.as_ref().is_some_and(|a| a.unavailable(now))
     }
@@ -165,10 +164,6 @@ impl KeyState {
             while self.failure_cycles.len() > 8 {
                 self.failure_cycles.pop_front();
             }
-            if self.failure_cycles.len() >= 2 {
-                self.cooldown_until =
-                    now + (600i64 * (1 << (self.failure_cycles.len() - 2).min(3))).min(3600);
-            }
         }
         self.service_failed = true;
         if transition {
@@ -189,7 +184,7 @@ impl KeyState {
                 self.recovery_successes += 1;
                 self.last_recovery_success = now;
             }
-            if self.recovery_successes >= 2 && self.cooldown_until <= now {
+            if self.recovery_successes >= 2 {
                 self.service_failed = false;
                 self.probe_attempts = 0;
                 self.probe_exhausted = false;
@@ -303,18 +298,13 @@ mod tests {
         assert_eq!(s.failure_cycles.len(), 1);
     }
     #[test]
-    fn recovery_does_not_bypass_flap_cooldown() {
+    fn recovery_never_blocks_routing_with_cooldown() {
         let mut s = KeyState::default();
         s.fail_service(100);
+        s.cooldown_until = 999999;
         s.probe_result(160, true);
         s.probe_result(220, true);
         assert!(s.eligible(220));
-        s.fail_service(230);
-        s.probe_result(290, true);
-        s.probe_result(350, true);
-        assert!(!s.eligible(350));
-        s.probe_result(831, true);
-        assert!(s.eligible(831));
     }
     #[test]
     fn events_bounded() {
