@@ -74,11 +74,15 @@ pub struct Observer {
     pub failed: bool,
     pub failure_status: Option<u16>,
     pub meaningful: bool,
+    pub output_text: bool,
     /// Set on the first error frame, based on preceding frames, not TCP chunks.
     pub retryable_failure: bool,
 }
 impl Observer {
     fn kind(&mut self, kind: &str) {
+        if kind == "response.output_text.delta" {
+            self.output_text = true;
+        }
         match kind {
             "response.completed" | "response.incomplete" | "response.done" | "done" => {
                 self.terminal = true;

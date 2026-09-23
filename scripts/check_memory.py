@@ -44,6 +44,12 @@ def main():
    time.sleep(2);samples.append({'phase':'settled','rss_kib':rss()})
    assert samples[-1]['rss_kib']<150*1024,samples
    assert samples[-1]['rss_kib']-samples[2]['rss_kib']<30*1024,samples
+   proc.terminate();proc.wait(timeout=10)
+   telemetry=json.loads(pathlib.Path(tmp,'state.json').read_text())['telemetry']
+   assert telemetry['today']['requests']==2400,telemetry['today']
+   assert telemetry['today']['success']==2200,telemetry['today']
+   assert telemetry['today']['cancelled']==200,telemetry['today']
+   assert len(telemetry['failures'])==200
    print(json.dumps({'requests':2200,'cancelled':200,'samples':samples},indent=2));(ROOT/'.runtime/memory-results.json').write_text(json.dumps(samples,indent=2))
   finally:proc.terminate();proc.wait(timeout=10);server.shutdown()
 if __name__=='__main__':main()

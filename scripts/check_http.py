@@ -72,9 +72,16 @@ def main():
    try:
     with opener.open(req,timeout=20) as r:
      raw=r.read()
+     if path=='/v1/responses':
+      assert r.headers.get('X-Request-ID','').startswith('fr_')
+      request.last_id=r.headers['X-Request-ID']
      if path=='/admin/api/save' and r.status==200:data['_revision']=json.loads(raw)['revision']
      return r.status,raw
-   except urllib.error.HTTPError as e:return e.code,e.read()
+   except urllib.error.HTTPError as e:
+    if path=='/v1/responses':
+     assert e.headers.get('X-Request-ID','').startswith('fr_')
+     request.last_id=e.headers['X-Request-ID']
+    return e.code,e.read()
   try:
    for _ in range(100):
     try:request('/');break
@@ -179,6 +186,15 @@ def main():
     if name=='large':assert b'P'*70000 in body
     if name=='huge':assert b'response_too_large' in body
     if name in ('together','split'):assert b'hello' in body and b'response.failed' in body
+    traffic=json.loads(request('/admin/api/state')[1])['traffic']
+    assert traffic['active']==0,traffic
+    if name in ('together','split','unknownterminal','huge','input','validation'):
+     report=next(r for r in traffic['failures'] if r['id']==request.last_id)
+     assert len(report['attempts'])==1
+     assert report['outcome']==('unknown' if name=='unknownterminal' else 'failed')
+     assert report['output_started']==(name in ('together','split','unknownterminal'))
+    assert 'upstream-secret' not in json.dumps(traffic)
+
    # Last-write-wins is rejected; a stale editor cannot overwrite a newer save.
    stale=json.loads(json.dumps(cfg));assert request('/admin/api/save',cfg)[0]==200
    cfg['api_key']='company-secret-2';assert request('/admin/api/save',cfg)[0]==200

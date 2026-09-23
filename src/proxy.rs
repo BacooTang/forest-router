@@ -9,12 +9,16 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
+#[derive(Clone)]
+struct RouterError(String);
 fn error(status: StatusCode, code: &str, message: &str) -> Response {
-    (
+    let mut response = (
         status,
         Json(json!({"error":{"code":code,"message":message,"type":"router_error"}})),
     )
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(RouterError(code.into()));
+    response
 }
 /// Public model catalog; availability is evaluated when a response is requested.
 pub async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -38,6 +42,37 @@ pub async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         .into_response()
 }
 pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Response {
+    let (trace, mut guard) = crate::telemetry::Trace::new(app.metrics.clone());
+    let response = responses_inner(app, request, trace.clone()).await;
+    trace.response(
+        response.status().as_u16(),
+        response
+            .extensions()
+            .get::<RouterError>()
+            .map(|e| e.0.as_str()),
+    );
+    let success_http = response.status().is_success();
+    let (mut parts, body) = response.into_parts();
+    parts
+        .headers
+        .insert("x-request-id", trace.id().parse().unwrap());
+    let stream = async_stream::stream! {
+        let mut body = body.into_data_stream();
+        let _keep_alive = &mut guard;
+        while let Some(chunk) = body.next().await {
+            if let Ok(bytes) = &chunk && success_http && !bytes.is_empty() { trace.output(); }
+            if chunk.is_err() { trace.result("failed", "downstream_body_error"); }
+            yield chunk;
+        }
+        guard.finish(false);
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+async fn responses_inner(
+    app: Arc<App>,
+    request: Request,
+    trace: crate::telemetry::Trace,
+) -> Response {
     let (parts, incoming) = request.into_parts();
     let headers = parts.headers;
     let cfg = app.config.read().await.clone();
@@ -50,6 +85,7 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
             "公司 API Key 不正确",
         );
     }
+    trace.begin(&app.metrics);
     let permit = match app.requests.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", "当前并发已满"),
@@ -109,6 +145,7 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
     let Some(route) = cfg.models.iter().find(|m| m.id == model) else {
         return error(StatusCode::NOT_FOUND, "model_not_found", "模型未配置");
     };
+    trace.model(&model);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     // External stored response identifiers are not portable across vendors.
     let pinned = payload
@@ -242,6 +279,7 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
                     request = request.header(name, value);
                 }
             }
+            trace.attempt(channel, key);
             let result = tokio::time::timeout_at(
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(30)),
                 request.send(),
@@ -250,11 +288,13 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
             let response = match result {
                 Ok(Ok(r)) => r,
                 _ => {
+                    trace.retry("connection_or_timeout");
                     fail(&app, &cfg, &key.id, &channel.name, 0).await;
                     continue;
                 }
             };
             let status = response.status();
+            trace.status(status.as_u16());
             if !status.is_success() {
                 let retry = response
                     .headers()
@@ -281,6 +321,7 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
                 if classified == 400 {
                     return (status, [("content-type", "application/json")], raw).into_response();
                 }
+                trace.retry(crate::telemetry::failure_reason(classified));
                 fail(&app, &cfg, &key.id, &channel.name, classified).await;
                 if classified == 429
                     && let Some(s) = app.state.lock().await.keys.get_mut(&key.id)
@@ -361,15 +402,19 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
                     );
                 }
                 if !matches!(collected, Ok(Ok(()))) {
+                    trace.retry("upstream_body_error");
                     fail(&app, &cfg, &key.id, &channel.name, 503).await;
                     continue;
                 }
                 let v = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
                 if !v.as_ref().is_some_and(crate::errors::valid_response) {
                     let class = classify(status.as_u16(), &bytes);
+                    trace.retry(crate::telemetry::failure_reason(class));
                     fail(&app, &cfg, &key.id, &channel.name, class).await;
                     continue;
                 }
+                trace.first();
+                trace.result("success", "completed");
                 record_success(&app, &cfg, &key.id).await;
                 record_route(&app, &cfg, &model, &channel.id, &channel.name).await;
                 let output = async_stream::stream! {let _permit=permit;let _budget=budget;yield Ok::<Bytes,std::io::Error>(Bytes::from(bytes));};
@@ -389,6 +434,9 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
                     match tokio::time::timeout_at(first_deadline, source.next()).await {
                         Ok(Some(Ok(bytes))) => {
                             observer.feed(&bytes);
+                            if observer.output_text {
+                                trace.first();
+                            }
                             prefix_size += bytes.len();
                             prefix.push(bytes);
                             if observer.retryable_failure {
@@ -425,6 +473,9 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
                 }
             }
             if early_failure {
+                trace.retry(crate::telemetry::failure_reason(
+                    observer.failure_status.unwrap_or(503),
+                ));
                 fail(
                     &app,
                     &cfg,
@@ -441,23 +492,24 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
             let key_id = key.id.clone();
             let channel_name = channel.name.clone();
             let stream = async_stream::stream! {
-                let _permit=permit;
-                if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}
-                for bytes in prefix {yield Ok::<Bytes,std::io::Error>(bytes);}
-                loop {
-                    match tokio::time::timeout(Duration::from_secs(120),source.next()).await {
-                        Ok(Some(Ok(bytes)))=>{if is_sse {observer.feed(&bytes);if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}}yield Ok::<Bytes,std::io::Error>(bytes);},
-                        Ok(None)=>{
-                            observer.finish();
-                            if observer.failed {fail(&app2,&config2,&key_id,&channel_name,observer.failure_status.unwrap_or(503)).await;}
-                            else if !observer.terminal {protocol_warning(&app2,&config2,&key_id,&channel_name).await;}
-                            else {record_success(&app2,&config2,&key_id).await;}
-                            break;
-                        },
-                        _=>{fail(&app2,&config2,&key_id,&channel_name,0).await;break;}
-                    }
-                }
-            };
+                            let _permit=permit;
+                            if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}
+                            for bytes in prefix {yield Ok::<Bytes,std::io::Error>(bytes);}
+                            loop {
+                                match tokio::time::timeout(Duration::from_secs(120),source.next()).await {
+                                    Ok(Some(Ok(bytes)))=>{if is_sse {observer.feed(&bytes);if observer.output_text {trace.first();}
+            if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}}yield Ok::<Bytes,std::io::Error>(bytes);},
+                                    Ok(None)=>{
+                                        observer.finish();
+                                        if observer.failed {trace.result("failed", crate::telemetry::failure_reason(observer.failure_status.unwrap_or(503)));fail(&app2,&config2,&key_id,&channel_name,observer.failure_status.unwrap_or(503)).await;}
+                                        else if !observer.terminal {trace.result("unknown", "unrecognized_terminal");protocol_warning(&app2,&config2,&key_id,&channel_name).await;}
+                                        else {trace.result("success", "completed");record_success(&app2,&config2,&key_id).await;}
+                                        break;
+                                    },
+                                    _=>{trace.result("failed", "stream_interrupted_or_timeout");fail(&app2,&config2,&key_id,&channel_name,0).await;break;}
+                                }
+                            }
+                        };
             return builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
                 error(StatusCode::BAD_GATEWAY, "response_error", "响应构造失败")
             });

@@ -6,6 +6,7 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 pub struct App {
+    pub metrics: Arc<std::sync::Mutex<crate::telemetry::Metrics>>,
     pub inflight: std::sync::Mutex<HashSet<String>>,
     pub persist: Mutex<()>,
     pub config: RwLock<Arc<Config>>,
@@ -40,7 +41,8 @@ impl App {
     }
     pub async fn persist(&self) -> Result<(), String> {
         let _guard = self.persist.lock().await;
-        let snapshot = self.state.lock().await.clone();
+        let mut snapshot = self.state.lock().await.clone();
+        snapshot.telemetry = self.metrics.lock().unwrap().snapshot();
         let path = self.data_dir.join("state.json");
         tokio::task::spawn_blocking(move || crate::storage::write_json(&path, &snapshot))
             .await

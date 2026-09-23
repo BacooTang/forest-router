@@ -11,6 +11,7 @@ mod scheduler;
 mod sse;
 mod state;
 mod storage;
+mod telemetry;
 mod upstream;
 
 use app::App;
@@ -117,6 +118,7 @@ async fn main() {
     };
     state.reconcile(&cfg);
     let app = Arc::new(App {
+        metrics: Arc::new(std::sync::Mutex::new(std::mem::take(&mut state.telemetry))),
         inflight: std::sync::Mutex::new(Default::default()),
         persist: Mutex::new(()),
         config: RwLock::new(Arc::new(cfg.clone())),

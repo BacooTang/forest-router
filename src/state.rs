@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
+    pub telemetry: crate::telemetry::Metrics,
     pub config_digest: String,
     pub identities: HashMap<String, String>,
     pub monitor_identities: HashMap<String, String>,

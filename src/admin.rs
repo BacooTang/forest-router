@@ -97,7 +97,7 @@ pub async fn state(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
     let state = app.state.lock().await.clone();
     (
         [("cache-control", "no-store")],
-        Json(json!({"config":config,"state":state})),
+        Json(json!({"config":config,"state":state,"traffic":app.metrics.lock().unwrap().view()})),
     )
         .into_response()
 }
