@@ -17,8 +17,9 @@ pub async fn probe(app: &App, c: &Channel, k: &Key) -> bool {
 }
 async fn probe_result(app: &App, c: &Channel, k: &Key) -> Probe {
     use futures_util::StreamExt;
+    let use_system_proxy = app.config.read().await.use_system_proxy;
     let result=tokio::time::timeout(Duration::from_secs(45),async {
-        let response=app.client.post(config::responses_url(&c.base_url)).bearer_auth(&k.secret)
+        let response=app.upstream_client(use_system_proxy).post(config::responses_url(&c.base_url)).bearer_auth(&k.secret)
             .json(&json!({"model":c.upstream_model,"input":"Reply OK.","max_output_tokens":256,"reasoning":{"effort":"low"},"stream":true}))
             .send().await.ok()?;
         if response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS {

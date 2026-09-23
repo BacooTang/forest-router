@@ -137,7 +137,13 @@ pub async fn balance_check(
         .get(&k.id)
         .map_or(0, |s| s.revision);
     let adapter = Adapter::for_model(model, c.adapter.clone());
-    let mut result = upstream::allowance(&app.client, &c.base_url, &k.secret, adapter).await;
+    let mut result = upstream::allowance(
+        &app.upstream_client(cfg.use_system_proxy),
+        &c.base_url,
+        &k.secret,
+        adapter,
+    )
+    .await;
     let request_exhausted = app
         .state
         .lock()

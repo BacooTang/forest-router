@@ -12,6 +12,7 @@ pub struct App {
     pub config: RwLock<Arc<Config>>,
     pub state: Mutex<State>,
     pub client: reqwest::Client,
+    pub system_client: std::sync::RwLock<reqwest::Client>,
     pub admin_requests: Arc<Semaphore>,
     pub checks: Arc<Semaphore>,
     pub login_slots: Arc<Semaphore>,
@@ -31,6 +32,14 @@ impl Drop for CheckGuard<'_> {
     }
 }
 impl App {
+    pub fn upstream_client(&self, system_proxy: bool) -> reqwest::Client {
+        if system_proxy {
+            self.system_client.read().unwrap().clone()
+        } else {
+            self.client.clone()
+        }
+    }
+
     pub fn begin(&self, id: String) -> Option<CheckGuard<'_>> {
         if !self.inflight.lock().unwrap().insert(id.clone()) {
             return None;

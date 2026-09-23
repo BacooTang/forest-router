@@ -6,6 +6,8 @@ pub struct Config {
     pub listen: String,
     pub api_key: String,
     #[serde(default)]
+    pub use_system_proxy: bool,
+    #[serde(default)]
     pub employee_keys: Vec<EmployeeKey>,
     pub admin_password_hash: String,
     #[serde(default)]

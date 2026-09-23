@@ -5,8 +5,14 @@ use crate::{
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
-pub fn client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+pub fn client(system_proxy: bool) -> Result<reqwest::Client, reqwest::Error> {
+    let builder = reqwest::Client::builder();
+    let builder = if system_proxy {
+        builder
+    } else {
+        builder.no_proxy()
+    };
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(600))
         .pool_max_idle_per_host(2)

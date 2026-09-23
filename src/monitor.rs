@@ -52,7 +52,7 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
     }
     let started = std::time::Instant::now();
     let outcome=async {
-        let response=app.client.post(format!("{root}/chat/completions")).bearer_auth(&m.key)
+        let response=app.upstream_client(cfg.use_system_proxy).post(format!("{root}/chat/completions")).bearer_auth(&m.key)
             .json(&json!({"model":m.model,"messages":[{"role":"user","content":CANDY}],"stream":false,"thinking":{"type":"enabled"},"reasoning_effort":"low"}))
             .timeout(Duration::from_secs(180)).send().await.map_err(|_|"检测请求失败".to_owned())?;
         let v=upstream::bounded_json(response).await?;

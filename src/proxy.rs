@@ -232,7 +232,7 @@ async fn responses_inner(
                 continue;
             };
             let mut request = app
-                .client
+                .upstream_client(cfg.use_system_proxy)
                 .post(config::responses_url(&channel.base_url))
                 .bearer_auth(&key.secret)
                 .header("content-type", "application/json")

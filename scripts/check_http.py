@@ -70,7 +70,7 @@ def main():
  global candy_answer,monitor_delay,probe_throttled,transient_fail
  server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream);threading.Thread(target=server.serve_forever,daemon=True).start();up=server.server_port
  with tempfile.TemporaryDirectory(prefix='forest-check-') as temp:
-  port=freeport();base=f'http://127.0.0.1:{port}';env=dict(os.environ,FOREST_ROUTER_HOME=temp,FOREST_LISTEN=f'127.0.0.1:{port}',FOREST_ADMIN_PASSWORD='test-password',FOREST_API_KEY='company-secret')
+  port=freeport();base=f'http://127.0.0.1:{port}';env=dict(os.environ,FOREST_ROUTER_HOME=temp,FOREST_LISTEN=f'127.0.0.1:{port}',FOREST_ADMIN_PASSWORD='test-password',FOREST_API_KEY='company-secret',HTTP_PROXY=f'http://127.0.0.1:{up}',http_proxy=f'http://127.0.0.1:{up}',HTTPS_PROXY=f'http://127.0.0.1:{up}',https_proxy=f'http://127.0.0.1:{up}',NO_PROXY='',no_proxy='')
   proc=subprocess.Popen([str(ROOT/'target/debug/forest-router')],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
   opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
   def request(path,data=None,auth=False):
@@ -123,6 +123,12 @@ def main():
    assert request('/v1/responses',{'model':'test-model','input':'hello'},employee)[0]==401
    cfg['employee_keys']=[];assert request('/admin/api/save',cfg)[0]==200
    assert 'employee-a' in json.loads(request('/admin/api/state')[1])['client_usage']['clients']
+   cfg['use_system_proxy']=True;assert request('/admin/api/save',cfg)[0]==200
+   before=len(seen);assert request('/v1/responses',{'model':'test-model','input':'proxy-check','stream':True},True)[0]==200
+   assert any(path.startswith('http://127.0.0.1:') for path,_,_ in seen[before:]),'enabled proxy not used'
+   cfg['use_system_proxy']=False;assert request('/admin/api/save',cfg)[0]==200
+   before=len(seen);assert request('/v1/responses',{'model':'test-model','input':'direct-check','stream':True},True)[0]==200
+   assert seen[-1][0]=='/usage/v1/responses','disabled proxy not bypassed'
    cfg['models']=[{'id':'test-model','channels':[channel('broken','bad'),channel('good','ok')]}]
    assert request('/admin/api/save',cfg)[0]==200
    status,catalog=request('/v1/models',auth=True);assert status==200

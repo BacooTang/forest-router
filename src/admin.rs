@@ -142,6 +142,9 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
     if v.get("employee_keys").is_none() {
         v["employee_keys"] = json!(old.employee_keys);
     }
+    if v.get("use_system_proxy").is_none() {
+        v["use_system_proxy"] = json!(old.use_system_proxy);
+    }
     v["admin_password_hash"] = json!(old.admin_password_hash);
     let password = v
         .as_object_mut()
@@ -154,6 +157,15 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
     if let Err(e) = cfg.validate() {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
+    let system_client = match crate::upstream::client(true) {
+        Ok(client) => client,
+        Err(_) => return (StatusCode::BAD_REQUEST, "系统代理客户端初始化失败").into_response(),
+    };
+    let validation_client = if cfg.use_system_proxy {
+        system_client.clone()
+    } else {
+        app.client.clone()
+    };
     if let Some(password) = password.filter(|p| !p.is_empty()) {
         if password.len() > 1024 {
             return StatusCode::BAD_REQUEST.into_response();
@@ -205,7 +217,7 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
                         },
                     );
                     match crate::upstream::allowance(
-                        &app.client,
+                        &validation_client,
                         &channel.base_url,
                         &key.secret,
                         kind,
@@ -286,6 +298,7 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
         state.config_digest = cfg.digest();
         state.prune(&cfg);
         state.event("config", "配置已保存".into());
+        *app.system_client.write().unwrap() = system_client;
         *current = Arc::new(cfg);
     }
     if password_changed {
@@ -376,8 +389,9 @@ pub async fn detect(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
     } else {
         crate::balance::Adapter::Auto
     };
+    let use_system_proxy = app.config.read().await.use_system_proxy;
     match crate::upstream::allowance(
-        &app.client,
+        &app.upstream_client(use_system_proxy),
         base,
         key,
         crate::balance::Adapter::for_model(model, configured),

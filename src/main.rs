@@ -94,6 +94,7 @@ async fn main() {
         let c = Config {
             listen: std::env::var("FOREST_LISTEN").unwrap_or_else(|_| "0.0.0.0:8119".into()),
             api_key,
+            use_system_proxy: false,
             employee_keys: vec![],
             admin_password_hash: hash,
             webhook: String::new(),
@@ -125,7 +126,8 @@ async fn main() {
         persist: Mutex::new(()),
         config: RwLock::new(Arc::new(cfg.clone())),
         state: Mutex::new(state),
-        client: upstream::client().expect("http client"),
+        client: upstream::client(false).expect("http client"),
+        system_client: std::sync::RwLock::new(upstream::client(true).expect("system proxy client")),
         admin_requests: Arc::new(Semaphore::new(8)),
         checks: Arc::new(Semaphore::new(4)),
         login_slots: Arc::new(Semaphore::new(1)),
