@@ -2,12 +2,12 @@
 
 公司内网使用的 Rust Responses 网关。员工配置一次公司地址和 Key，管理员按模型维护有序渠道。
 
-- `GET /v1/models`：使用公司 Bearer Key 鉴权，返回配置中心的对外模型列表（object=list/data）；仅包含id、object、created、owned_by，不暴露上游配置。所有已配置模型均列出，是否可用在请求时判断；created为0（未保存模型创建时间）。
+- `GET /v1/models`：使用总 Key 或启用的员工 Bearer Key 鉴权，返回配置中心的对外模型列表（object=list/data）；仅包含id、object、created、owned_by，不暴露上游配置。所有已配置模型均列出，是否可用在请求时判断；created为0（未保存模型创建时间）。
 - `POST /v1/responses`：模型精确匹配，替换 URL、Authorization、顶层 model；其他 JSON 值及正常响应内容透传。请求会重新序列化（键序可能变化，重复键合并），响应成功正文保持原字节。
 - 渠道按优先级选择；同渠道多 Key 轮询。提供者和每把Key可独立开关，关闭提供者整组跳过，全部Key关闭也跳过该提供者；关闭的Key不参与后台额度/恢复检查，重新开启保留健康状态。质量、余额、服务状态分别显示。
 - New API / Sub2API 自动识别；现有订阅站 `/v1/subscriptions`；模型名包含 deepseek / glm（忽略大小写）优先用各自官方额度接口。
 - 降智监控沿用 codex-test 当前定时任务的糖果题、low、单次判据。只检测绑定到启用渠道的监控 ID。
-- 浅色管理页：配置中心、降智监控、日志、设置（仅配置中心显示模型侧栏）；日志只保留最近200条事件。
+- 浅色管理页：配置中心、Key 管理、运行统计、降智监控、日志、设置（仅配置中心显示模型侧栏）；日志只保留最近200条事件。
 - 公司及上游 API Key 明文写入配置，可在页面查看编辑。管理员密码使用 Argon2。
 - 无数据库，单实例运行；配置和运行状态原子写入本地文件。
 
@@ -24,13 +24,13 @@ export FOREST_API_KEY='公司统一Key'
 ./target/release/forest-router
 ```
 
-启动可传 `--port 80`（也支持 `--port=80`），优先于已保存的监听地址，以 `0.0.0.0:80` 监听；不传参数沿用配置，首次初始化默认 `0.0.0.0:8119`。PM2 在 `ecosystem.config.cjs` 的 `args` 中配置，调试默认 `--port 8119`，部署改为 `--port 80`。设置页只读显示实际端口。启动覆盖本身不写配置；随后在管理页保存配置时会保存当前监听地址。
+启动可传 `--port 80`（也支持 `--port=80`），优先于已保存的监听地址，以 `0.0.0.0:80` 监听；不传参数沿用配置，首次初始化默认 `0.0.0.0:8119`。PM2 在 `ecosystem.config.cjs` 的 `args` 中配置，示例默认 `--port 8119`，部署按目标端口覆盖（当前另一台 Mac 使用 `--port 8117`）。设置页只读显示实际端口。启动覆盖本身不写配置；随后在管理页保存配置时会保存当前监听地址。
 
 首次启动生成 `FOREST_ROUTER_HOME/config.json`。以后从文件读取，初始环境变量可以移除。未设置数据目录时默认使用当前目录的 `.runtime`。正式密码及飞书 Webhook 由管理员在部署时设置；仓库无固定默认密码或真实账号配置。
 
 浏览器访问服务器的 8119 端口，创建模型、渠道和监控。添加/更换 Key 时服务端也会识别平台并验证额度接口，结果立即写入状态。未知或无法识别的平台会显示明确错误。新增/变更凭证验证总预算60秒，任一失败整份配置不保存；建议分批添加。保存需携带当前配置版本，过期编辑返回409；等待其他保存最多5秒。
 
-客户端 Base URL 指向 `http://公司服务器:8119/v1`，使用公司 Key；模型填写管理页模型名。网关不修改客户端模型清单和提示词。
+客户端 Base URL 指向 `http://公司服务器:8119/v1`，使用总 Key 或员工 Key；模型填写管理页模型名。网关不修改客户端模型清单和提示词。
 
 ## 路由与恢复
 
@@ -114,3 +114,42 @@ Responses响应头返回网关生成的 `X-Request-ID`。在运行统计页可�
 用量按上海时间的请求开始日期归属，保留今天及前四个自然日，00:00 开始新一天；输入、缓存命中、输出分别展示，总 Token 为输入＋输出，缓存已包含在输入中。每个上游尝试只计一份最新有效 usage，候选切换后各次用量合计。流式大帧通过有界扫描提取 usage，不修改透传字节；未返回 usage 的请求标注缺失，已返回部分仍计入，不能视为完整供应商账单。后台检查不计入员工用量。
 
 统计随运行状态每10秒原子保存，正常退出保存；异常终止可能丢失最近一次保存后的数据。失败追踪关联员工名称及 Key ID，不记录完整凭证或正文。旧配置自动兼容，员工 Key 默认空列表。
+
+## Mac / PM2 部署
+
+2026-09-23 部署记录：另一台 Mac 使用 PM2 托管 `forest-router`，监听 `0.0.0.0:8117`。原开发机服务和数据保留。远端已验证本机 HTTP 200，外部访问及端口映射未验证；执行了 `pm2 save`，不据此宣称已经验证整机重启自动恢复。
+
+部署目录位于目标用户的 `$HOME/Applications/forest-router`：`repo/` 为代码，`bin/forest-router` 为运行二进制，`data/` 为完整配置与状态。首次迁移同时复制 config.json、state.json；以后更新代码不要覆盖正在使用的数据。运行二进制与源码目录分离，单独 git pull 不会更新运行程序。
+
+远程 SSH 命令需使用 `zsh -lic` 加载用户 PATH，才能找到现有 Node/PM2。进入该 Mac 的 zsh 终端后：
+
+```sh
+pm2 status forest-router
+pm2 restart forest-router
+pm2 save
+curl -I http://127.0.0.1:8117/
+```
+
+首次启动使用目标机器上的绝对数据目录，不能直接使用仓库 ecosystem 示例中的 `./data`：
+
+```sh
+FOREST_ROUTER_HOME="$HOME/Applications/forest-router/data"   pm2 start "$HOME/Applications/forest-router/bin/forest-router"   --name forest-router --interpreter none --kill-timeout 15000 -- --port 8117
+pm2 save
+```
+
+更新时在有 Rust 的环境构建匹配目标架构/macOS版本的 release 二进制，替换 `bin/forest-router` 后再重启。首次部署使用本机构建的 Apple Silicon 二进制；后续在目标机安装最小 Rust 工具链并从源码构建。未修改其他 PM2 应用。不要同时用独立 launchd 服务与 PM2 启动同一数据目录。
+
+目标机已安装 Rust 后，在 zsh 中更新并编译启动：
+
+```sh
+cd "$HOME/Applications/forest-router/repo"
+git pull --ff-only
+"$HOME/.cargo/bin/cargo" build --release --locked
+cp target/release/forest-router ../bin/forest-router.next
+mv ../bin/forest-router.next ../bin/forest-router
+pm2 restart forest-router
+pm2 save
+curl -I http://127.0.0.1:8117/
+```
+
+上述更新保留 `../data`，构建失败时不要执行后续替换与重启。

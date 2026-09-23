@@ -5,6 +5,7 @@
 Rust单实例Responses网关，Axum/Tokio/Reqwest，无数据库。
 - `src/proxy.rs`：Responses透传、候选选择；`src/errors.rs` / `sse.rs`：错误与流观察。
 - `src/config.rs` / `state.rs` / `storage.rs`：配置、独立Key状态、原子持久化。
+- `src/usage.rs` / `telemetry.rs`：员工Key五日Token统计及请求追踪。
 - `src/admin.rs` / `static/index.html`：管理API与内嵌管理页。
 - `src/scheduler.rs` / `health.rs` / `monitor.rs` / `balance.rs`：额度、恢复、质量检测。
 - `scripts/check_*.py` / `check_ui.cjs`：隔离回归；`docs/`：运行规则、历史验收及审查。
@@ -20,6 +21,9 @@ Rust单实例Responses网关，Axum/Tokio/Reqwest，无数据库。
 - 恢复探测及通知有界；变更状态前保持配置快照/版本保护。
 - 配置中心显示模型侧栏，其他Tab不显示；管理页保持浅色紧凑布局。渠道拖拽排序，开关在右侧。
 - 监控时间段全局配置、上海时区；默认规则见README。不要将未知、降智、过期混为成功。
+
+- 总Key保留，不可删除；员工Key停用/删除拒绝新请求，已开始请求继续完成。
+- 用量按上海时间请求开始日归属，保留今天及前四天；缓存属于输入，缺失usage明确标注，后台检查不计入。
 
 ## 隐私与操作范围
 
@@ -43,6 +47,8 @@ python3 scripts/check_http.py
 UI变更可用 `PLAYWRIGHT_MODULE=/path/to/node_modules/playwright node scripts/check_ui.cjs`；流/内存变更再运行发布版内存回归。真实脚本默认拒绝运行，详见README。
 
 默认初始化监听0.0.0.0:8119；`--port 80`覆盖本次监听，PM2配置默认显式传8119。数据目录由FOREST_ROUTER_HOME指定；不要多实例共用同一目录。
+
+当前Mac部署用PM2、端口8117；远程命令加载 `zsh -lic`。运行程序位于目标用户 `~/Applications/forest-router/bin/`，数据位于 `data/`，不要用仓库示例的相对数据目录覆盖。开发机8119保留，其他代理不动；`pm2 save`不等于已验证开机自启。详见README。
 
 ## CodeGraph
 
