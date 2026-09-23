@@ -112,15 +112,7 @@ pub fn spawn(app: Arc<App>) {
                     .cloned()
                     .collect::<Vec<_>>()
             };
-            stream::iter(monitors)
-                .for_each_concurrent(2, |m| {
-                    let app = app.clone();
-                    let cfg = cfg.clone();
-                    async move {
-                        monitor::check(&app, &cfg, &m).await;
-                    }
-                })
-                .await;
+            monitor::batch(&app, &cfg, monitors).await;
         }
     });
 }

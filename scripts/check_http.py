@@ -104,7 +104,7 @@ def main():
    assert seen[-2][0]=='/bad/v1/responses' and seen[-1][0]=='/ok/v1/responses'
    assert seen[-1][2]==dict(payload,model='upstream-model')
    assert seen[-1][1].get('authorization')=='Bearer upstream-secret'
-   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['broken-key']['service_failed'];assert state['last_used']['test-model']=='good'
+   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['broken-key']['service_failed'];assert state['last_used']['test-model']=='good';assert state['keys']['good-key']['checked']
    before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1
    assert request('/v1/responses',dict(payload,model='missing'),True)[0]==404
    assert request('/v1/responses',dict(payload,previous_response_id='private'),True)[0]==400
@@ -143,6 +143,19 @@ def main():
    assert not json.loads(request('/admin/api/state')[1])['state']['notices']
    candy_answer='21';assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    assert request('/v1/responses',payload,True)[0]==200
+   assert not cfg.get('notify_all_monitors',False)
+   cfg['notify_all_monitors']=True;assert request('/admin/api/save',cfg)[0]==200
+   for _round in range(2):
+    before=len(hooks)
+    assert request('/admin/api/verify',{'all_monitors':True})[0]==200
+    for _ in range(80):
+     if len(hooks)>before:break
+     time.sleep(.1)
+    assert len(hooks)==before+1,hooks
+    card=hooks[-1];assert card['msg_type']=='interactive'
+    assert card['card']['header']['template']=='green'
+    assert 'monitor-key' not in json.dumps(card)
+   cfg['notify_all_monitors']=False;assert request('/admin/api/save',cfg)[0]==200
    cfg['webhook']=''
    for prefix,flag in [('jsonauth','credential_failed'),('unknown','service_failed')]:
     cfg['models'][0]['channels']=[channel(prefix,prefix),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
@@ -161,6 +174,8 @@ def main():
     assert status==expected,(name,status,body[:200]);assert len(seen)==before+1,(name,'request replayed')
     state=json.loads(request('/admin/api/state')[1])['state'];key=state['keys']['review-'+name+'-key']
     assert key['service_failed']==(name in ('together','split')),(name,key)
+    if name in ('large','alias','silent','okextra'):assert key['checked'],(name,'successful response not recorded')
+    if name in ('unknownterminal','together','split','huge','input','validation'):assert not key['checked'],(name,'failure recorded as success')
     if name=='large':assert b'P'*70000 in body
     if name=='huge':assert b'response_too_large' in body
     if name in ('together','split'):assert b'hello' in body and b'response.failed' in body

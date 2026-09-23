@@ -94,6 +94,7 @@ async fn main() {
             api_key,
             admin_password_hash: hash,
             webhook: String::new(),
+            notify_all_monitors: false,
             models: vec![],
             monitors: vec![],
             monitor_schedule: config::default_monitor_schedule(),

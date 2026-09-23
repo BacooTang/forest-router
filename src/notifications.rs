@@ -28,7 +28,10 @@ pub fn spawn(app: Arc<App>) {
                 let r = app
                     .client
                     .post(&cfg.webhook)
-                    .json(&json!({"msg_type":"text","content":{"text":n.message}}))
+                    .json(&match &n.card {
+                        Some(card) => json!({"msg_type":"interactive","card":card}),
+                        None => json!({"msg_type":"text","content":{"text":n.message}}),
+                    })
                     .timeout(Duration::from_secs(15))
                     .send()
                     .await

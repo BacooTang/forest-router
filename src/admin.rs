@@ -283,6 +283,15 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let cfg = app.config.read().await.clone();
+    if v["all_monitors"].as_bool() == Some(true) {
+        return match crate::monitor::batch(&app, &cfg, cfg.monitors.clone()).await {
+            Some(completed) => {
+                Json(json!({"ok":true,"completed":completed,"total":cfg.monitors.len()}))
+                    .into_response()
+            }
+            None => (StatusCode::CONFLICT, "监控正在执行或配置已变化，请稍后重试").into_response(),
+        };
+    }
     let id = v["channel_id"].as_str().unwrap_or("");
     let reset = v["reset"].as_bool().unwrap_or(false);
     if let Some((model, c)) = cfg
@@ -303,7 +312,7 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
             .as_ref()
             .and_then(|id| cfg.monitors.iter().find(|m| m.id == *id))
         {
-            complete &= crate::monitor::check(&app, &cfg, m).await;
+            complete &= crate::monitor::batch(&app, &cfg, vec![m.clone()]).await == Some(1);
         }
         let _ = app.persist().await;
         if !complete {
@@ -320,7 +329,7 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
         .iter()
         .find(|m| Some(m.id.as_str()) == v["monitor_id"].as_str())
     {
-        if !crate::monitor::check(&app, &cfg, m).await {
+        if crate::monitor::batch(&app, &cfg, vec![m.clone()]).await != Some(1) {
             return (StatusCode::CONFLICT, "监控正在执行或配置已变化，请稍后重试").into_response();
         }
         let _ = app.persist().await;

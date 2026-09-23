@@ -41,6 +41,7 @@ pub struct KeyState {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Quality {
+    pub response_ms: Option<u64>,
     pub last_definite: String,
     pub history: VecDeque<QualityPoint>,
     pub error: String,
@@ -205,6 +206,8 @@ pub struct QualityPoint {
 pub struct Notice {
     pub id: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<serde_json::Value>,
     pub attempts: u32,
     pub next_at: i64,
 }
@@ -217,6 +220,7 @@ impl State {
         self.notices.push_back(Notice {
             id: format!("{:016x}", rand::random::<u64>()),
             message,
+            card: None,
             attempts: 0,
             next_at: 0,
         });

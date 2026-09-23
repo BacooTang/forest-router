@@ -9,6 +9,8 @@ pub struct Config {
     #[serde(default)]
     pub webhook: String,
     #[serde(default)]
+    pub notify_all_monitors: bool,
+    #[serde(default)]
     pub models: Vec<Model>,
     #[serde(default)]
     pub monitors: Vec<Monitor>,

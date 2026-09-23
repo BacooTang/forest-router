@@ -50,6 +50,7 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
     if !root.ends_with("/v1") {
         root.push_str("/v1");
     }
+    let started = std::time::Instant::now();
     let outcome=async {
         let response=app.client.post(format!("{root}/chat/completions")).bearer_auth(&m.key)
             .json(&json!({"model":m.model,"messages":[{"role":"user","content":CANDY}],"stream":false,"thinking":{"type":"enabled"},"reasoning_effort":"low"}))
@@ -73,6 +74,10 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         Ok(false) => "degraded",
         Err(_) => "unknown",
     };
+    q.response_ms = outcome
+        .as_ref()
+        .ok()
+        .map(|_| started.elapsed().as_millis() as u64);
     q.verdict = verdict.into();
     q.checked_at = now;
     q.next_at = next(now, &cfg.monitor_schedule);
@@ -102,7 +107,11 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
             ),
         );
     }
-    if previously_healthy && verdict == "degraded" && !cfg.webhook.is_empty() {
+    if previously_healthy
+        && verdict == "degraded"
+        && !cfg.webhook.is_empty()
+        && !cfg.notify_all_monitors
+    {
         state.notify(format!(
             "降智提醒：{}（{}）已从满血变为降智，关联渠道暂停使用。",
             m.name, m.id
@@ -110,9 +119,124 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
     }
     true
 }
+// One batch produces one summary, including manual runs. Never publish stale config results.
+pub async fn batch(app: &Arc<App>, cfg: &Arc<Config>, monitors: Vec<Monitor>) -> Option<usize> {
+    use futures_util::{StreamExt, stream};
+    if monitors.is_empty() {
+        return Some(0);
+    }
+    let _guard = app.begin("monitor-round".into())?;
+    let done = stream::iter(monitors)
+        .map(|m| async move {
+            if check(app, cfg, &m).await {
+                Some(m.id)
+            } else {
+                None
+            }
+        })
+        .buffer_unordered(2)
+        .filter_map(|id| async move { id })
+        .collect::<Vec<_>>()
+        .await;
+    let current = app.config.read().await;
+    if !Arc::ptr_eq(&current, cfg) {
+        return None;
+    }
+    if !done.is_empty() && cfg.notify_all_monitors && !cfg.webhook.is_empty() {
+        let mut state = app.state.lock().await;
+        for card in summary_cards(cfg, &state, &done, chrono::Utc::now().timestamp()) {
+            state.notify("降智监控全量检测报告".into());
+            state.notices.back_mut().unwrap().card = Some(card);
+        }
+    }
+    drop(current);
+    let _ = app.persist().await;
+    Some(done.len())
+}
+fn summary_cards(
+    cfg: &Config,
+    state: &crate::state::State,
+    done: &[String],
+    now: i64,
+) -> Vec<serde_json::Value> {
+    let mut counts = [0usize; 4];
+    let mut rows = Vec::new();
+    for m in &cfg.monitors {
+        let q = state.quality.get(&m.id);
+        let checked = done.contains(&m.id);
+        let (index, label) = if !checked {
+            (2, "⚪ 本轮未检测")
+        } else {
+            match q.map(|q| q.verdict.as_str()) {
+                Some("healthy") => (0, "🟢 满血"),
+                Some("degraded") => (1, "🔴 非满血"),
+                _ => (3, "🟠 验证异常"),
+            }
+        };
+        counts[index] += 1;
+        let elapsed = q
+            .filter(|_| checked)
+            .and_then(|q| q.response_ms)
+            .map(|ms| format!("{:.1}s", ms as f64 / 1000.))
+            .unwrap_or("—".into());
+        rows.push(json!({"tag":"div","fields":[
+            {"is_short":true,"text":{"tag":"plain_text","content":m.name}},
+            {"is_short":true,"text":{"tag":"plain_text","content":format!("{label} · 响应 {elapsed}")}}
+        ]}));
+    }
+    let (color, title) = if counts[1] > 0 {
+        ("red", "满血检测 · 存在非满血渠道")
+    } else if counts[2] + counts[3] > 0 {
+        ("orange", "满血检测 · 部分渠道尚不能判定")
+    } else {
+        ("green", "满血检测 · 全部满血")
+    };
+    let fields = ["满血", "非满血", "本轮未检测", "验证异常"].iter().enumerate().map(|(i, label)|
+        json!({"is_short":true,"text":{"tag":"plain_text","content":format!("{label}\n{} 个", counts[i])}})
+    ).collect::<Vec<_>>();
+    let mut cards = Vec::new();
+    // Feishu cards have a payload limit: preserve full names and paginate large configurations.
+    for (page, chunk) in rows.chunks(20).enumerate() {
+        let mut elements = vec![json!({"tag":"div","fields":fields}), json!({"tag":"hr"})];
+        elements.extend_from_slice(chunk);
+        let time = chrono::DateTime::from_timestamp(now, 0)
+            .unwrap()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .format("%m-%d %H:%M")
+            .to_string();
+        elements.push(json!({"tag":"hr"}));
+        elements.push(json!({"tag":"note","elements":[{"tag":"plain_text","content":format!("{time} · 共 {} 个监控 · 本轮检测 {} 个 · 糖果判据\n详细结果请到降智监控页面查看", cfg.monitors.len(), done.len())}]}));
+        cards.push(json!({"config":{"wide_screen_mode":true},"header":{"template":color,"title":{"tag":"plain_text","content":format!("{title} · {}/{}", page+1, rows.len().div_ceil(20))}},"elements":elements}));
+    }
+    cards
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn summary_keeps_unknown_and_stale_results_separate() {
+        let cfg: Config = serde_json::from_value(json!({"listen":"0.0.0.0:8119","api_key":"test","admin_password_hash":"",
+            "monitors":[{"id":"a","name":"A","base_url":"http://localhost","key":"secret","model":"test"},
+                        {"id":"b","name":"B","base_url":"http://localhost","key":"secret","model":"test"}]})).unwrap();
+        assert!(!cfg.notify_all_monitors);
+        let mut state = crate::state::State::default();
+        state.quality.entry("a".into()).or_default().verdict = "healthy".into();
+        state.quality.entry("b".into()).or_default().verdict = "healthy".into();
+        let cards = summary_cards(&cfg, &state, &["a".into()], 0);
+        assert_eq!(cards[0]["header"]["template"], "orange");
+        assert!(cards[0].to_string().contains("本轮未检测"));
+        assert!(!cards[0].to_string().contains("secret"));
+        state.quality.get_mut("b").unwrap().verdict = "degraded".into();
+        assert_eq!(
+            summary_cards(&cfg, &state, &["a".into(), "b".into()], 0)[0]["header"]["template"],
+            "red"
+        );
+        state.quality.get_mut("b").unwrap().verdict = "unknown".into();
+        assert_eq!(
+            summary_cards(&cfg, &state, &["a".into(), "b".into()], 0)[0]["header"]["template"],
+            "orange"
+        );
+    }
     #[test]
     fn answer_boundaries() {
         for t in ["21", "答案为21。", "x21x"] {

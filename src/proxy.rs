@@ -370,6 +370,7 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
                     fail(&app, &cfg, &key.id, &channel.name, class).await;
                     continue;
                 }
+                record_success(&app, &cfg, &key.id).await;
                 record_route(&app, &cfg, &model, &channel.id, &channel.name).await;
                 let output = async_stream::stream! {let _permit=permit;let _budget=budget;yield Ok::<Bytes,std::io::Error>(Bytes::from(bytes));};
                 return builder.body(Body::from_stream(output)).unwrap_or_else(|_| {
@@ -441,14 +442,16 @@ pub async fn responses(State(app): State<Arc<App>>, request: Request) -> Respons
             let channel_name = channel.name.clone();
             let stream = async_stream::stream! {
                 let _permit=permit;
+                if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}
                 for bytes in prefix {yield Ok::<Bytes,std::io::Error>(bytes);}
                 loop {
                     match tokio::time::timeout(Duration::from_secs(120),source.next()).await {
-                        Ok(Some(Ok(bytes)))=>{if is_sse {observer.feed(&bytes);}yield Ok::<Bytes,std::io::Error>(bytes);},
+                        Ok(Some(Ok(bytes)))=>{if is_sse {observer.feed(&bytes);if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}}yield Ok::<Bytes,std::io::Error>(bytes);},
                         Ok(None)=>{
                             observer.finish();
                             if observer.failed {fail(&app2,&config2,&key_id,&channel_name,observer.failure_status.unwrap_or(503)).await;}
                             else if !observer.terminal {protocol_warning(&app2,&config2,&key_id,&channel_name).await;}
+                            else {record_success(&app2,&config2,&key_id).await;}
                             break;
                         },
                         _=>{fail(&app2,&config2,&key_id,&channel_name,0).await;break;}
@@ -480,6 +483,16 @@ async fn protocol_warning(app: &App, cfg: &Arc<config::Config>, id: &str, name: 
             format!("{name}：SSE正常关闭但未识别终态，保持原文，不判定Key故障"),
         );
     }
+}
+// Successful business traffic is service evidence, but never clears a newer fault or cooldown.
+async fn record_success(app: &App, cfg: &Arc<config::Config>, id: &str) {
+    let current = app.config.read().await;
+    if !Arc::ptr_eq(&current, cfg) {
+        return;
+    }
+    let mut state = app.state.lock().await;
+    let key = state.keys.entry(id.to_owned()).or_default();
+    key.checked = true;
 }
 async fn record_route(app: &App, cfg: &Arc<config::Config>, model: &str, id: &str, name: &str) {
     let current = app.config.read().await;
