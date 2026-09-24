@@ -28,7 +28,7 @@ async fn probe_result(app: &App, c: &Channel, k: &Key) -> Probe {
             let delay=response.headers().get("retry-after").and_then(|h|h.to_str().ok()).and_then(|s|s.parse::<i64>().ok()).unwrap_or(300).clamp(60,3600);
             let body = upstream::bounded_json(response).await.ok();
             let class = crate::errors::classify(status, &body.and_then(|v| serde_json::to_vec(&v).ok()).unwrap_or_default());
-            return Some(if matches!(class, 401 | 402) { Probe::Definite(class) } else if class == 429 { Probe::Throttled(delay) } else if status >= 500 { Probe::Definite(status) } else { Probe::Failed });
+            return Some(if matches!(class, 401 | 402) { Probe::Definite(class) } else if class == 429 { Probe::Throttled(delay) } else if status >= 500 && status != 504 { Probe::Definite(status) } else { Probe::Failed });
         }
         if response.headers().get("content-type").and_then(|h|h.to_str().ok()).is_some_and(|h|h.starts_with("text/event-stream")) {
             let mut source=response.bytes_stream();let mut observer=crate::sse::Observer::default();let mut bytes=0;

@@ -601,7 +601,7 @@ async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, s
             s.revision += 1;
             (changed, "rate_limit")
         }
-        500..=599 => (s.fail_service(now), "service"),
+        500..=599 if status != 504 => (s.fail_service(now), "service"),
         _ => (s.suspect_service(now), "service"),
     };
     s.reason = if s.suspect {

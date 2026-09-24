@@ -59,6 +59,8 @@ class Upstream(http.server.BaseHTTPRequestHandler):
   for prefix,(status,value) in variants.items():
    if self.path.startswith(prefix):
     out=json.dumps(value).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+  if self.path.startswith('/timeout/'):
+   self.send_response(504);self.send_header('Content-Length','0');self.end_headers();return
   if self.path.startswith('/bad/'):
    self.send_response(503);self.send_header('Content-Length','0');self.end_headers();return
   if self.path.startswith('/empty/'):
@@ -238,6 +240,20 @@ def main():
     time.sleep(.25)
    assert not key['suspect'] and not key['service_failed'],key
    assert request('/v1/responses',payload,True)[0]==200
+
+   # A 504 on business traffic and on a tiny probe must both preserve grace.
+   cfg['models'][0]['channels']=[channel('timeout','timeout'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
+   for _ in range(2):
+    before=sum(path=='/timeout/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)
+    assert request('/v1/responses',payload,True)[0]==200
+    assert sum(path=='/timeout/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)==before+1
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key'];assert key['suspect'] and not key['service_failed']
+   deadline=time.time()+15
+   while time.time()<deadline:
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key']
+    if key['confirmation_failures']>0:break
+    time.sleep(.25)
+   assert key['confirmation_failures']>0 and key['suspect'] and not key['service_failed'],key
 
    for prefix,flag in [('jsonauth','credential_failed'),('unknown','suspect')]:
     cfg['models'][0]['channels']=[channel(prefix,prefix),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
