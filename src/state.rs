@@ -133,7 +133,7 @@ impl KeyState {
             self.probe_step = 0;
             self.probe_attempts = 0;
             self.probe_exhausted = false;
-            self.retry_at = now + 60;
+            self.retry_at = now + 30;
         }
         self.revision += 1;
         transition
@@ -252,11 +252,13 @@ mod tests {
         assert!(!s.eligible(999999));
     }
     #[test]
-    fn retry_intervals_are_one_two_three_four_five() {
+    fn first_probe_after_thirty_seconds_then_two_three_four_five_minutes() {
         let mut s = KeyState::default();
         s.fail_service(0);
-        assert_eq!(s.retry_at, 60);
-        for (t, expected) in [(60, 180), (180, 360), (360, 600), (600, 900), (900, 1200)] {
+        assert_eq!(s.retry_at, 30);
+        s.fail_service(10);
+        assert_eq!(s.retry_at, 30);
+        for (t, expected) in [(30, 150), (150, 330), (330, 570), (570, 870), (870, 1170)] {
             s.probe_result(t, false);
             assert_eq!(s.retry_at, expected);
         }
@@ -265,10 +267,11 @@ mod tests {
     fn immediate_repeated_success_cannot_bypass_recovery_window() {
         let mut s = KeyState::default();
         s.fail_service(0);
-        s.probe_result(60, true);
-        s.probe_result(61, true);
+        s.probe_result(30, true);
+        assert_eq!(s.retry_at, 90);
+        s.probe_result(31, true);
         assert!(s.service_failed);
-        s.probe_result(120, true);
+        s.probe_result(90, true);
         assert!(!s.service_failed);
     }
     #[test]
