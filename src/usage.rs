@@ -58,6 +58,7 @@ impl Ledger {
         id: &str,
         name: &str,
         at: i64,
+        model: &str,
         attempts: &[crate::telemetry::Attempt],
     ) {
         let now = chrono::Utc::now().timestamp();
@@ -70,6 +71,12 @@ impl Ledger {
         c.last_used = c.last_used.max(at);
         let d = c.days.entry(day(at)).or_default();
         d.requests += 1;
+        // These model families are always excluded from token accounting.
+        // Keep request activity, but do not report intentionally ignored usage as missing.
+        let model = model.to_ascii_lowercase();
+        if model.contains("glm") || model.contains("deepseek") {
+            return;
+        }
         if attempts.is_empty() || attempts.iter().any(|a| a.usage.is_none()) {
             d.missing += 1;
         }
@@ -221,12 +228,50 @@ mod tests {
             crate::telemetry::Attempt::default(),
         ];
         let mut l = Ledger::default();
-        l.record("employee", "员工", now, &attempts);
+        l.record("employee", "员工", now, "gpt-6", &attempts);
         let restored: Ledger = serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap();
         let d = &restored.clients["employee"].days[&day(now)];
         assert_eq!(
             (d.requests, d.missing, d.input, d.cached, d.output),
             (1, 1, 25, 10, 5)
+        );
+    }
+    #[test]
+    fn excluded_models_keep_activity_without_tokens_or_missing_usage() {
+        let now = chrono::Utc::now().timestamp();
+        let mut ledger = Ledger::default();
+        let attempts = [
+            crate::telemetry::Attempt {
+                usage: Some(Tokens {
+                    input: 20,
+                    cached: 10,
+                    output: 3,
+                }),
+                ..Default::default()
+            },
+            crate::telemetry::Attempt::default(),
+        ];
+        for model in [
+            "GLM-5.3",
+            "zhipu/gLm-5",
+            "DeepSeek-V4",
+            "vendor/DEEPSEEK-flash",
+        ] {
+            ledger.record("employee", "员工", now, model, &attempts);
+            ledger.record("employee", "员工", now, model, &[]);
+        }
+        let c = &ledger.clients["employee"];
+        let d = &c.days[&day(now)];
+        assert_eq!(c.last_used, now);
+        assert_eq!(
+            (d.requests, d.missing, d.input, d.cached, d.output),
+            (8, 0, 0, 0, 0)
+        );
+        ledger.record("employee", "员工", now, "gpt-6", &attempts);
+        let d = &ledger.clients["employee"].days[&day(now)];
+        assert_eq!(
+            (d.requests, d.missing, d.input, d.cached, d.output),
+            (9, 1, 20, 10, 3)
         );
     }
     #[test]

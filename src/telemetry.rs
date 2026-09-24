@@ -284,7 +284,7 @@ impl Guard {
         m.roll(now);
         m.active = m.active.saturating_sub(1);
         m.client_usage
-            .record(&r.client_id, &r.client_name, r.at, &r.attempts);
+            .record(&r.client_id, &r.client_name, r.at, &r.model, &r.attempts);
         // Daily outcomes belong to request start day, so yesterday's long streams do not skew today's rate.
         if (r.at + 8 * 3600).div_euclid(86400) == m.day {
             m.today.result(&r.outcome, r.first_ms);
@@ -365,6 +365,43 @@ mod tests {
         restored.roll(chrono::Utc::now().timestamp() + 86400);
         assert_eq!(restored.today.requests, 0);
         assert!(restored.hours.is_empty());
+    }
+    #[test]
+    fn excluded_model_finish_and_cancel_keep_request_metrics() {
+        let metrics = Arc::new(Mutex::new(Metrics::default()));
+        for model in ["GLM-5.3", "DeepSeek-flash"] {
+            for cancelled in [false, true] {
+                let (trace, mut guard) = Trace::new(metrics.clone());
+                trace.client("employee".into(), "员工".into());
+                trace.model(model);
+                trace.begin(&metrics);
+                trace.result("success", "");
+                if cancelled {
+                    drop(guard);
+                } else {
+                    guard.finish(false);
+                }
+            }
+        }
+        let m = metrics.lock().unwrap();
+        assert_eq!(
+            (
+                m.active,
+                m.today.requests,
+                m.today.success,
+                m.today.cancelled
+            ),
+            (0, 4, 2, 2)
+        );
+        let d = m.client_usage.clients["employee"]
+            .days
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(
+            (d.requests, d.missing, d.input, d.cached, d.output),
+            (4, 0, 0, 0, 0)
+        );
     }
     #[test]
     fn retry_keeps_each_cause_and_counts_once() {
