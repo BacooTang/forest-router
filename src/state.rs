@@ -28,6 +28,8 @@ pub struct KeyState {
     pub balance_error: Option<String>,
     pub service_failed: bool,
     pub suspect: bool,
+    pub confirmation_at: i64,
+    pub confirmation_failures: u32,
     pub last_incident: Option<i64>,
     pub credential_failed: bool,
     pub cooldown_until: i64,
@@ -86,8 +88,7 @@ impl State {
 }
 impl KeyState {
     pub fn eligible(&self, now: i64) -> bool {
-        !self.suspect
-            && !self.probe_exhausted
+        !self.probe_exhausted
             && !self.service_failed
             && !self.credential_failed
             && self.retry_at <= now
@@ -98,12 +99,21 @@ impl KeyState {
         if self.suspect || self.service_failed {
             return false;
         }
-        if self.last_incident.is_some_and(|t| now - t < 600) {
-            return self.fail_service(now);
-        }
         self.last_incident = Some(now);
         self.suspect = true;
-        self.retry_at = now + 5;
+        self.confirmation_at = now + 5;
+        self.confirmation_failures = 0;
+        self.revision += 1;
+        false
+    }
+    pub fn confirmation_failed(&mut self, now: i64) -> bool {
+        self.confirmation_failures = self.confirmation_failures.saturating_add(1);
+        if self.confirmation_failures >= 3
+            && self.last_incident.is_some_and(|start| now - start >= 60)
+        {
+            return self.fail_service(now);
+        }
+        self.confirmation_at = now + 15;
         self.revision += 1;
         false
     }
@@ -170,12 +180,38 @@ mod tests {
         let rev = s.revision;
         assert!(!s.suspect_service(101));
         assert_eq!(s.revision, rev);
-        assert!(!s.eligible(1000));
+        assert!(s.eligible(100));
+        assert!(!s.confirmation_failed(105));
+        assert!(!s.confirmation_failed(120));
+        assert!(!s.confirmation_failed(135));
+        assert!(!s.confirmation_failed(150));
+        assert!(s.confirmation_failed(165));
+        assert!(!s.eligible(165));
+    }
+    #[test]
+    fn recovered_incident_gets_a_new_confirmation_window() {
+        let mut s = KeyState::default();
+        s.suspect_service(100);
         s.suspect = false;
         s.retry_at = 0;
-        assert!(s.suspect_service(150));
-        assert!(s.service_failed);
+        assert!(!s.suspect_service(150));
+        assert!(!s.service_failed);
+        assert!(s.suspect);
+        assert_eq!(s.last_incident, Some(150));
+    }
+    #[test]
+    fn slow_probes_still_require_three_failures_and_hard_faults_skip_grace() {
+        let mut s = KeyState::default();
+        s.suspect_service(100);
+        assert!(!s.confirmation_failed(160));
+        assert!(!s.confirmation_failed(220));
+        assert!(s.eligible(220));
+        assert!(s.confirmation_failed(280));
+        let mut s = KeyState::default();
+        s.suspect_service(100);
+        assert!(s.fail_service(101));
         assert!(!s.suspect);
+        assert!(!s.eligible(101));
     }
     #[test]
     fn degraded_quality_excludes_all_keys_and_legacy_hold_is_ignored() {

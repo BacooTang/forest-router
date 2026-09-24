@@ -69,6 +69,8 @@ pub fn spawn(app: Arc<App>) {
                                         (s.service_failed || s.suspect)
                                             && !s.probe_exhausted
                                             && s.retry_at <= now
+                                            && (!s.suspect || s.confirmation_at <= now)
+                                            && !s.credential_failed
                                             && !s.allowance.as_ref().is_some_and(|a| a.exhausted)
                                     })
                                 })

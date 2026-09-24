@@ -10,6 +10,7 @@ use std::{sync::Arc, time::Duration};
 pub enum Probe {
     Healthy,
     Failed,
+    Definite(u16),
     Throttled(i64),
 }
 pub async fn probe(app: &App, c: &Channel, k: &Key) -> bool {
@@ -22,23 +23,29 @@ async fn probe_result(app: &App, c: &Channel, k: &Key) -> Probe {
         let response=app.upstream_client(use_system_proxy).post(config::responses_url(&c.base_url)).bearer_auth(&k.secret)
             .json(&json!({"model":c.upstream_model,"input":"Reply OK.","max_output_tokens":256,"reasoning":{"effort":"low"},"stream":true}))
             .send().await.ok()?;
-        if response.status()==reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let status = response.status().as_u16();
+        if !response.status().is_success(){
             let delay=response.headers().get("retry-after").and_then(|h|h.to_str().ok()).and_then(|s|s.parse::<i64>().ok()).unwrap_or(300).clamp(60,3600);
-            return Some(Probe::Throttled(delay));
+            let body = upstream::bounded_json(response).await.ok();
+            let class = crate::errors::classify(status, &body.and_then(|v| serde_json::to_vec(&v).ok()).unwrap_or_default());
+            return Some(if matches!(class, 401 | 402) { Probe::Definite(class) } else if class == 429 { Probe::Throttled(delay) } else if status >= 500 { Probe::Definite(status) } else { Probe::Failed });
         }
-        if !response.status().is_success(){return Some(Probe::Failed);}
         if response.headers().get("content-type").and_then(|h|h.to_str().ok()).is_some_and(|h|h.starts_with("text/event-stream")) {
             let mut source=response.bytes_stream();let mut observer=crate::sse::Observer::default();let mut bytes=0;
             while let Some(chunk)=source.next().await {
                 let Ok(chunk)=chunk else {return Some(Probe::Failed);};
                 bytes+=chunk.len();if bytes>262144{return Some(Probe::Failed);}
-                observer.feed(&chunk);if observer.failed{return Some(Probe::Failed);}
+                observer.feed(&chunk);if observer.failed{return Some(match observer.failure_status {Some(code @ (401 | 402)) => Probe::Definite(code), Some(429) => Probe::Throttled(60), _ => Probe::Failed});}
                 if observer.terminal{return Some(Probe::Healthy);}
             }
             observer.finish();
             Some(if observer.terminal && !observer.failed {Probe::Healthy}else{Probe::Failed})
         } else {
             let v=upstream::bounded_json(response).await.ok()?;
+            if !crate::errors::valid_response(&v) {
+                let class = crate::errors::classify(200, &serde_json::to_vec(&v).ok()?);
+                return Some(match class {401 | 402 => Probe::Definite(class), 429 => Probe::Throttled(60), _ => Probe::Failed});
+            }
             Some(if crate::errors::valid_response(&v){Probe::Healthy}else{Probe::Failed})
         }
     }).await;
@@ -130,6 +137,28 @@ pub async fn check(
         s.checked = true;
         s.credential_failed = false;
         false
+    } else if let Probe::Definite(code @ (401 | 402)) = outcome {
+        s.suspect = false;
+        s.revision += 1;
+        if code == 401 {
+            s.credential_failed = true;
+            s.reason = "凭证失效".into();
+        } else {
+            s.request_exhausted = true;
+            s.balance_checked = now;
+            s.allowance.get_or_insert_with(Default::default).exhausted = true;
+            s.reason = "额度耗尽".into();
+        }
+        false
+    } else if s.suspect && !matches!(outcome, Probe::Definite(_)) {
+        s.reason = "网络异常确认中，继续可用；持续至少60秒且多次验证失败后隔离".into();
+        // Legacy persisted incidents may not have a start timestamp.
+        s.last_incident.get_or_insert(now);
+        let failed = s.confirmation_failed(now);
+        if failed {
+            s.reason = "网络异常持续至少60秒，且多次最小 Responses 验证失败".into();
+        }
+        failed
     } else if !s.service_failed {
         s.reason = "最小 Responses 验证失败".into();
         s.fail_service(now)
@@ -138,7 +167,7 @@ pub async fn check(
         false
     };
     let exhausted = s.probe_exhausted;
-    let recovered = (failed_before || suspect_before) && !s.service_failed && !s.suspect;
+    let recovered = ok && (failed_before || suspect_before) && !s.service_failed && !s.suspect;
     if exhausted {
         state.event(
             "service",

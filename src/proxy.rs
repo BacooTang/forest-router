@@ -314,7 +314,16 @@ async fn responses_inner(
                     return (status, [("content-type", "application/json")], raw).into_response();
                 }
                 trace.retry(crate::telemetry::failure_reason(classified));
-                fail(&app, &cfg, &key.id, &channel.name, classified).await;
+                let fault = if classified == 503 {
+                    if status.is_server_error() {
+                        status.as_u16()
+                    } else {
+                        0
+                    }
+                } else {
+                    classified
+                };
+                fail(&app, &cfg, &key.id, &channel.name, fault).await;
                 if classified == 429
                     && let Some(s) = app.state.lock().await.keys.get_mut(&key.id)
                 {
@@ -371,7 +380,7 @@ async fn responses_inner(
                 .await;
                 if !matches!(collected, Ok(Ok(()))) {
                     trace.retry("upstream_body_error");
-                    fail(&app, &cfg, &key.id, &channel.name, 503).await;
+                    fail(&app, &cfg, &key.id, &channel.name, 0).await;
                     continue;
                 }
                 let v = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
@@ -382,7 +391,14 @@ async fn responses_inner(
                 if !v.as_ref().is_some_and(crate::errors::valid_response) {
                     let class = classify(status.as_u16(), &bytes);
                     trace.retry(crate::telemetry::failure_reason(class));
-                    fail(&app, &cfg, &key.id, &channel.name, class).await;
+                    fail(
+                        &app,
+                        &cfg,
+                        &key.id,
+                        &channel.name,
+                        if class == 503 { 0 } else { class },
+                    )
+                    .await;
                     continue;
                 }
                 trace.first();
@@ -449,14 +465,14 @@ async fn responses_inner(
             }
             if early_failure {
                 trace.retry(crate::telemetry::failure_reason(
-                    observer.failure_status.unwrap_or(503),
+                    observer.failure_status.filter(|s| *s != 503).unwrap_or(0),
                 ));
                 fail(
                     &app,
                     &cfg,
                     &key.id,
                     &channel.name,
-                    observer.failure_status.unwrap_or(503),
+                    observer.failure_status.filter(|s| *s != 503).unwrap_or(0),
                 )
                 .await;
                 continue;
@@ -476,7 +492,7 @@ async fn responses_inner(
             if observer.terminal && !observer.failed {record_success(&app2,&config2,&key_id).await;}}yield Ok::<Bytes,std::io::Error>(bytes);},
                                     Ok(None)=>{
                                         observer.finish(); trace.usage(observer.usage.take());
-                                        if observer.failed {trace.result("failed", crate::telemetry::failure_reason(observer.failure_status.unwrap_or(503)));fail(&app2,&config2,&key_id,&channel_name,observer.failure_status.unwrap_or(503)).await;}
+                                        if observer.failed {trace.result("failed", crate::telemetry::failure_reason(observer.failure_status.unwrap_or(503)));fail(&app2,&config2,&key_id,&channel_name,observer.failure_status.filter(|s| *s != 503).unwrap_or(0)).await;}
                                         else if !observer.terminal {trace.result("unknown", "unrecognized_terminal");protocol_warning(&app2,&config2,&key_id,&channel_name).await;}
                                         else {trace.result("success", "completed");record_success(&app2,&config2,&key_id).await;}
                                         break;
@@ -585,10 +601,11 @@ async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, s
             s.revision += 1;
             (changed, "rate_limit")
         }
+        500..=599 => (s.fail_service(now), "service"),
         _ => (s.suspect_service(now), "service"),
     };
     s.reason = if s.suspect {
-        "暂时异常，等待快速确认"
+        "网络异常确认中，继续可用"
     } else {
         match status {
             401 => "凭证失效",
@@ -600,7 +617,10 @@ async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, s
     }
     .into();
     if s.suspect && !was_suspect {
-        state.event("service", format!("{name} / {id}：暂时异常，等待快速确认"));
+        state.event(
+            "service",
+            format!("{name} / {id}：网络异常确认中，继续可用"),
+        );
     }
     if changed && matches!(kind, "balance" | "service") && !cfg.webhook.is_empty() {
         state.notify(format!(

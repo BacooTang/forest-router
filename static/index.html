@@ -45,14 +45,14 @@ function toast(message){$('notice').textContent=message;$('notice').classList.re
 async function api(path,body){const r=await fetch('/admin/api/'+path,{method:body===undefined?'GET':'POST',headers:{'content-type':'application/json','x-forest-admin':'1'},body:body===undefined?undefined:JSON.stringify(body)});if(r.status===401){$('login').classList.remove('hidden');$('app').classList.add('hidden');throw Error('请登录管理员账号')}if(!r.ok){let text=await r.text();try{text=JSON.parse(text).error||text}catch{}throw Error(text||'操作失败')}return r.json()}
 function toggle(enabled,action,id,label){return `<button type="button" role="switch" aria-checked="${enabled}" aria-label="${esc(label)}" title="${enabled?'点击停用':'点击启用'}" class="toggle ${enabled?'on':''}" data-action="${action}" data-id="${esc(id)}"></button>`}
 function badge(t,c=''){return `<span class="badge ${c}">${esc(t)}</span>`}function stamp(t){return t?new Date(t*1000).toLocaleString('zh-CN',{hour12:false}):'尚未检查'}
-function keyReason(s={}){const n=Date.now()/1000;if(s.probe_exhausted)return ['待手动验证','red'];if(s.credential_failed)return ['凭证失效','red'];if(s.allowance?.exhausted||(s.allowance?.expires_at&&s.allowance.expires_at<=n))return ['额度耗尽','orange'];if(s.service_failed)return ['服务不可用','red'];if(s.suspect)return ['暂时异常，待确认','orange'];if(s.retry_at>n)return ['限流等待','orange'];return ['可用','green']}
+function keyReason(s={}){const n=Date.now()/1000;if(s.probe_exhausted)return ['待手动验证','red'];if(s.credential_failed)return ['凭证失效','red'];if(s.allowance?.exhausted||(s.allowance?.expires_at&&s.allowance.expires_at<=n))return ['额度耗尽','orange'];if(s.service_failed)return ['服务不可用','red'];if(s.retry_at>n)return ['限流等待','orange'];if(s.suspect)return ['网络异常确认中，继续可用','orange'];return ['可用','green']}
 function quality(c){if(!c.monitor_id)return ['未监控',''];const q=data.state.quality[c.monitor_id];if(!q)return ['等待检测','orange'];if(q.verdict==='unknown'&&q.error)return ['检测异常'+(/^HTTP \d{3}$/.test(q.error)?' · '+q.error:''),'orange'];if(q.last_definite==='degraded'||q.verdict==='degraded')return ['降智','purple'];if(q.valid_until<=Date.now()/1000)return ['结果过期','orange'];if(q.verdict==='unknown'&&q.last_definite==='healthy')return ['沿用上次满血','orange'];return badges[q.verdict]||['质量未知','orange']}
 function serviceStatus(c){
  if(!c.enabled)return ['服务已停用',''];
  const keys=c.keys.filter(k=>k.enabled!==false);
  if(!keys.length)return ['服务已停用',''];
  const available=keys.filter(k=>keyReason(data.state.keys[k.id]||{})[0]==='可用');
- if(!available.length)return keys.some(k=>data.state.keys[k.id]?.suspect)?['暂时异常，待确认','orange']:['服务不可用','red'];
+ if(!available.length)return keys.some(k=>keyReason(data.state.keys[k.id]||{})[0]==='网络异常确认中，继续可用')?['网络异常确认中，继续可用','orange']:['服务不可用','red'];
  if(available.some(k=>data.state.keys[k.id]?.checked))return ['服务可用','green'];
  return ['服务未验证','orange'];
 }

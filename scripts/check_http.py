@@ -24,7 +24,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
     status,raw=monitor_error;self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw);return
    out=json.dumps({'choices':[{'message':{'content':candy_answer},'finish_reason':'stop'}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
   if self.path.startswith('/transient/') and transient_fail and d.get('input')!='Reply OK.':
-   self.send_response(503);self.send_header('Content-Length','0');self.end_headers();return
+   self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
   if self.path.startswith('/early/'):
    out=b'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n';self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
   if self.path.startswith('/usage/'):
@@ -38,7 +38,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
    failed=b'data: {"type":"response.failed","response":{"error":{"code":"server_error"}}}\n\n'
    if name=='large':out=b'data: '+json.dumps({'response':{'status':'completed','output':[],'pad':'P'*70000},'type':'response.completed'}).encode()+b'\n\n'
    elif name=='alias':out=b'data: {"type":"response.done"}\n\n'
-   elif name=='unknownterminal':out=delta
+   elif name in ('unknownterminal','interrupted'):out=delta
    elif name in ('together','split'):out=delta+failed
    elif name=='silent':out=b'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'
    elif name=='huge':ct='application/json';out=json.dumps({'status':'completed','output':[],'pad':'x'*(9*1024*1024)}).encode()
@@ -46,7 +46,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
    elif name=='validation':status=422;ct='application/json';out=b'{"detail":[{"msg":"field required"}]}'
    elif name=='okextra':ct='application/json';out=b'{"status":"completed","output":[],"code":"ok","error":{}}'
    else:raise AssertionError(name)
-   self.send_response(status);self.send_header('Content-Type',ct);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.flush()
+   self.send_response(status);self.send_header('Content-Type',ct);self.send_header('Content-Length',str(len(out)+(100 if name=='interrupted' else 0)));self.end_headers();self.wfile.flush()
    try:
     if name=='silent':time.sleep(11)
     if name=='split':self.wfile.write(delta);self.wfile.flush();time.sleep(.15);self.wfile.write(failed)
@@ -143,7 +143,7 @@ def main():
    assert seen[-2][0]=='/bad/v1/responses' and seen[-1][0]=='/ok/v1/responses'
    assert seen[-1][2]==dict(payload,model='upstream-model')
    assert seen[-1][1].get('authorization')=='Bearer upstream-secret'
-   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['broken-key']['suspect'];assert state['last_used']['test-model']=='good';assert state['keys']['good-key']['checked']
+   state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys']['broken-key']['service_failed'];assert state['last_used']['test-model']=='good';assert state['keys']['good-key']['checked']
    before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1
    assert request('/v1/responses',dict(payload,model='missing'),True)[0]==404
    assert request('/v1/responses',dict(payload,previous_response_id='private'),True)[0]==400
@@ -224,16 +224,26 @@ def main():
    assert request('/v1/responses',payload,True)[0]==200 and seen[-1][0]=='/transient/v1/responses'
    transient_fail=True
    cfg['models'][0]['channels'][1]['enabled']=False;assert request('/admin/api/save',cfg)[0]==200
-   # A second business failure after successful tiny probe must escalate.
+   # Repeated transport errors get a fresh grace window and remain routable.
    assert request('/v1/responses',payload,True)[0]==503
-   assert json.loads(request('/admin/api/state')[1])['state']['keys']['transient-key']['service_failed']
+   key=json.loads(request('/admin/api/state')[1])['state']['keys']['transient-key'];assert key['suspect'] and not key['service_failed']
+   before=sum(path=='/transient/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)
+   assert request('/v1/responses',payload,True)[0]==503
+   assert sum(path=='/transient/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)==before+1
    transient_fail=False
+   deadline=time.time()+15
+   while time.time()<deadline:
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['transient-key']
+    if not key['suspect']:break
+    time.sleep(.25)
+   assert not key['suspect'] and not key['service_failed'],key
+   assert request('/v1/responses',payload,True)[0]==200
 
    for prefix,flag in [('jsonauth','credential_failed'),('unknown','suspect')]:
     cfg['models'][0]['channels']=[channel(prefix,prefix),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
     status,body=request('/v1/responses',payload,True);assert status==200 and b'response.completed' in body
     state=json.loads(request('/admin/api/state')[1])['state'];assert state['keys'][prefix+'-key'][flag]
-    before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1
+    before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+(2 if prefix=='unknown' else 1)
    cfg['models'][0]['channels']=[channel('input','input'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
    before=len(seen);assert request('/v1/responses',payload,True)[0]==400;assert len(seen)==before+1
    cfg['models'][0]['channels']=[channel('duplicate1','bad'),channel('duplicate2','bad'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
@@ -242,12 +252,16 @@ def main():
    assert request('/v1/responses',dict(payload,input='x'*(9*1024*1024)),True)[0]==200
    cfg['models'][0]['channels']=[channel('cap'+str(i),'bad/'+str(i)) for i in range(10)];assert request('/admin/api/save',cfg)[0]==200
    before=len(seen);assert request('/v1/responses',payload,True)[0]==503;assert len(seen)==before+10
-   for name,expected in [('large',200),('alias',200),('unknownterminal',200),('together',200),('split',200),('silent',200),('huge',200),('input',400),('validation',422),('okextra',200)]:
+   for name,expected in [('large',200),('alias',200),('unknownterminal',200),('interrupted',200),('together',200),('split',200),('silent',200),('huge',200),('input',400),('validation',422),('okextra',200)]:
     cfg['models'][0]['channels']=[channel('review-'+name,'review/'+name),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
     before=len(seen);status,body=request('/v1/responses',payload,True)
     assert status==expected,(name,status,body[:200]);assert len(seen)==before+1,(name,'request replayed')
     state=json.loads(request('/admin/api/state')[1])['state'];key=state['keys']['review-'+name+'-key']
-    assert key['suspect']==(name in ('together','split')),(name,key)
+    assert key['suspect']==(name in ('together','split','interrupted')),(name,key)
+    if name=='interrupted':
+     assert not key['service_failed'] and b'hello' in body
+     before=len(seen);assert request('/v1/responses',payload,True)[0]==200;assert len(seen)==before+1
+     assert seen[-1][0]=='/review/interrupted/v1/responses'
     if name in ('large','alias','silent','okextra'):assert key['checked'],(name,'successful response not recorded')
     if name in ('unknownterminal','together','split','input','validation'):assert not key['checked'],(name,'failure recorded as success')
     if name=='large':assert b'P'*70000 in body
@@ -271,7 +285,7 @@ def main():
    assert request('/v1/responses',payload,True)[0]==503
    before=len(seen);cfg['models'][0]['id']='renamed-model';assert request('/admin/api/save',cfg)[0]==200
    assert len(seen)==before
-   assert json.loads(request('/admin/api/state')[1])['state']['keys']['allbad-key']['suspect']
+   assert json.loads(request('/admin/api/state')[1])['state']['keys']['allbad-key']['service_failed']
    cfg['models'][0]['id']='test-model';assert request('/admin/api/save',cfg)[0]==200
    assert len(json.loads(request('/admin/api/state')[1])['state']['events'])<=200
    # Persisted failures survive graceful restart; manual reset requires actual success.
