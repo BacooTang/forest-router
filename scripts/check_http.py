@@ -241,19 +241,16 @@ def main():
    assert not key['suspect'] and not key['service_failed'],key
    assert request('/v1/responses',payload,True)[0]==200
 
-   # A 504 on business traffic and on a tiny probe must both preserve grace.
+   # Queue timeouts never mark a healthy key suspect or consume failure budget.
    cfg['models'][0]['channels']=[channel('timeout','timeout'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
    for _ in range(2):
     before=sum(path=='/timeout/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)
     assert request('/v1/responses',payload,True)[0]==200
     assert sum(path=='/timeout/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)==before+1
-    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key'];assert key['suspect'] and not key['service_failed']
-   deadline=time.time()+15
-   while time.time()<deadline:
-    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key']
-    if key['confirmation_failures']>0:break
-    time.sleep(.25)
-   assert key['confirmation_failures']>0 and key['suspect'] and not key['service_failed'],key
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key'];assert not key['suspect'] and not key['service_failed']
+   request('/admin/api/verify',{'channel_id':'timeout'})
+   key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key']
+   assert key['confirmation_failures']==0 and key['probe_attempts']==0 and not key['suspect'] and not key['service_failed'] and key['retry_at']==0,key
 
    for prefix,flag in [('jsonauth','credential_failed'),('unknown','suspect')]:
     cfg['models'][0]['channels']=[channel(prefix,prefix),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200

@@ -10,6 +10,7 @@ use std::{sync::Arc, time::Duration};
 pub enum Probe {
     Healthy,
     Failed,
+    Busy,
     Definite(u16),
     Throttled(i64),
 }
@@ -24,6 +25,7 @@ async fn probe_result(app: &App, c: &Channel, k: &Key) -> Probe {
             .json(&json!({"model":c.upstream_model,"input":"Reply OK.","max_output_tokens":256,"reasoning":{"effort":"low"},"stream":true}))
             .send().await.ok()?;
         let status = response.status().as_u16();
+        if status == 504 { return Some(Probe::Busy); }
         if !response.status().is_success(){
             let delay=response.headers().get("retry-after").and_then(|h|h.to_str().ok()).and_then(|s|s.parse::<i64>().ok()).unwrap_or(300).clamp(60,3600);
             let body = upstream::bounded_json(response).await.ok();
@@ -84,6 +86,25 @@ pub async fn check(
     let s = state.keys.entry(k.id.clone()).or_default();
     if s.revision != revision {
         return false;
+    }
+    if matches!(outcome, Probe::Busy) {
+        // Do not count congestion as either recovery or service failure.
+        if s.suspect {
+            s.confirmation_at = now + 60;
+        } else if s.service_failed {
+            s.retry_at = now + 60;
+        }
+        s.revision += 1;
+        if manual {
+            state.event(
+                "check",
+                format!(
+                    "{} / {}：HTTP 504，上游繁忙，本次验证无结论",
+                    c.name, k.label
+                ),
+            );
+        }
+        return true;
     }
     let failed_before = s.service_failed;
     let suspect_before = s.suspect;

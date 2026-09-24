@@ -559,6 +559,10 @@ async fn record_route(app: &App, cfg: &Arc<config::Config>, model: &str, id: &st
 }
 
 async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, status: u16) {
+    // Gateway queue timeouts are request failures, not evidence of a bad Key.
+    if status == 504 {
+        return;
+    }
     let cfg = app.config.read().await;
     if !Arc::ptr_eq(&cfg, expected) {
         return;
