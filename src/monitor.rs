@@ -55,7 +55,7 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         let response=app.upstream_client(cfg.use_system_proxy).post(format!("{root}/chat/completions")).bearer_auth(&m.key)
             .json(&json!({"model":m.model,"messages":[{"role":"user","content":CANDY}],"stream":false,"thinking":{"type":"enabled"},"reasoning_effort":"low"}))
             .timeout(Duration::from_secs(180)).send().await.map_err(|_|"检测请求失败".to_owned())?;
-        let v=upstream::bounded_json(response).await?;
+        let v=upstream::monitor_json(response).await?;
         let text=v["choices"][0]["message"]["content"].as_str().filter(|s|!s.is_empty()).ok_or("检测响应缺少答案")?;
         if v["choices"][0]["finish_reason"]=="length" {return Err("检测答案被截断".into());}
         Ok::<_,String>(judge(text))
