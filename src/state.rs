@@ -142,6 +142,10 @@ impl KeyState {
         self.revision += 1;
         self.probe_attempts = self.probe_attempts.saturating_add(1);
         if ok {
+            if self.reason == "连续恢复探测预算已耗尽，等待手动验证或修改配置"
+            {
+                self.reason.clear();
+            }
             if self.recovery_successes == 0 || now - self.last_recovery_success >= 60 {
                 self.recovery_successes += 1;
                 self.last_recovery_success = now;
@@ -274,6 +278,18 @@ mod tests {
         s.probe_result(90, true);
         assert!(!s.service_failed);
     }
+    #[test]
+    fn successful_probe_clears_stale_budget_reason() {
+        let mut s = KeyState::default();
+        s.fail_service(0);
+        s.reason = "连续恢复探测预算已耗尽，等待手动验证或修改配置".into();
+        s.probe_attempts = 4;
+        s.probe_result(30, true);
+        assert!(s.service_failed);
+        assert!(!s.probe_exhausted);
+        assert!(s.reason.is_empty());
+    }
+
     #[test]
     fn concurrent_failures_are_one_cycle() {
         let mut s = KeyState::default();

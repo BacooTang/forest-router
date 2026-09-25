@@ -5,6 +5,20 @@ use crate::{
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
+pub const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
+
+/// Build a gateway initiated request with the browser compatible headers required by some WAFs.
+/// Business proxy requests must keep using their original client headers.
+pub fn control_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, url)
+        .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
+}
+
 pub fn client(system_proxy: bool) -> Result<reqwest::Client, reqwest::Error> {
     let builder = reqwest::Client::builder();
     let builder = if system_proxy {
@@ -165,7 +179,7 @@ async fn query(
     key: &str,
     raw_auth: bool,
 ) -> Result<Value, String> {
-    let r = client.get(url).timeout(Duration::from_secs(20));
+    let r = control_request(client, reqwest::Method::GET, url).timeout(Duration::from_secs(20));
     let r = if raw_auth {
         r.header("Authorization", key)
     } else {
@@ -220,6 +234,32 @@ pub async fn allowance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_requests_use_browser_agent_without_changing_proxy_client() {
+        let client = client(false).unwrap();
+        let request = control_request(
+            &client,
+            reqwest::Method::POST,
+            "http://localhost/v1/responses",
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.headers().get(reqwest::header::USER_AGENT).unwrap(),
+            BROWSER_USER_AGENT
+        );
+        let proxy_request = client
+            .post("http://localhost/v1/responses")
+            .build()
+            .unwrap();
+        assert!(
+            proxy_request
+                .headers()
+                .get(reqwest::header::USER_AGENT)
+                .is_none()
+        );
+    }
 
     #[test]
     fn monitor_errors_explain_http_and_upstream_fields() {

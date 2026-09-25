@@ -5,6 +5,7 @@ use crate::{
 };
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
+const PROBE_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 /// Recovery requests use a tiny independent prompt, never replay company history.
 #[derive(Clone, Copy)]
 pub enum Probe {
@@ -21,7 +22,7 @@ async fn probe_result(app: &App, c: &Channel, k: &Key) -> Probe {
     use futures_util::StreamExt;
     let use_system_proxy = app.config.read().await.use_system_proxy;
     let result=tokio::time::timeout(Duration::from_secs(45),async {
-        let response=app.upstream_client(use_system_proxy).post(config::responses_url(&c.base_url)).bearer_auth(&k.secret)
+        let response=upstream::control_request(&app.upstream_client(use_system_proxy), reqwest::Method::POST, &config::responses_url(&c.base_url)).bearer_auth(&k.secret)
             .json(&json!({"model":c.upstream_model,"input":"Reply OK.","max_output_tokens":256,"reasoning":{"effort":"low"},"stream":true}))
             .send().await.ok()?;
         let status = response.status().as_u16();
@@ -36,7 +37,7 @@ async fn probe_result(app: &App, c: &Channel, k: &Key) -> Probe {
             let mut source=response.bytes_stream();let mut observer=crate::sse::Observer::default();let mut bytes=0;
             while let Some(chunk)=source.next().await {
                 let Ok(chunk)=chunk else {return Some(Probe::Failed);};
-                bytes+=chunk.len();if bytes>262144{return Some(Probe::Failed);}
+                bytes+=chunk.len();if bytes>PROBE_BYTE_LIMIT{return Some(Probe::Failed);}
                 observer.feed(&chunk);if observer.failed{return Some(match observer.failure_status {Some(code @ (401 | 402)) => Probe::Definite(code), Some(429) => Probe::Throttled(60), _ => Probe::Failed});}
                 if observer.terminal{return Some(Probe::Healthy);}
             }
