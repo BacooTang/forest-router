@@ -11,6 +11,37 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 #[derive(Clone)]
 struct RouterError(String);
+// Only emit controlled categories, never arbitrary upstream strings/headers.
+fn diagnostic_gateway(headers: &HeaderMap) -> serde_json::Value {
+    let server = headers
+        .get("server")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let media = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    json!({"server":if server.contains("cloudflare"){"cloudflare"}else if server.contains("openresty"){"openresty"}else if server.contains("nginx"){"nginx"}else{"other"},"media":if media.contains("json"){"json"}else if media.contains("html"){"html"}else if media.contains("event-stream"){"sse"}else{"other"},"cf_ray":headers.contains_key("cf-ray"),"request_id":headers.contains_key("x-request-id")})
+}
+fn diagnostic_error(raw: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(&raw[..raw.len().min(262144)]).to_ascii_lowercase();
+    let markers: Vec<_> = [
+        "bad gateway",
+        "overloaded",
+        "timeout",
+        "no available",
+        "insufficient",
+        "rate_limit",
+        "cloudflare",
+        "upstream",
+        "invalid_api_key",
+    ]
+    .into_iter()
+    .filter(|s| text.contains(s))
+    .collect();
+    json!({"json":serde_json::from_slice::<serde_json::Value>(raw).is_ok(),"markers":markers})
+}
 fn error(status: StatusCode, code: &str, message: &str) -> Response {
     let mut response = (
         status,
@@ -231,6 +262,33 @@ async fn responses_inner(
             let Ok(out) = serde_json::to_vec(&payload) else {
                 continue;
             };
+            let request_bytes = out.len();
+            let features = if cfg.diagnostics_enabled {
+                let value = |key: &str| {
+                    payload
+                        .get(key)
+                        .and_then(|v| serde_json::from_str::<serde_json::Value>(v.get()).ok())
+                };
+                let reasoning = value("reasoning");
+                let effort = reasoning
+                    .as_ref()
+                    .and_then(|v| v["effort"].as_str())
+                    .filter(|s| {
+                        matches!(
+                            *s,
+                            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                        )
+                    })
+                    .unwrap_or("other_or_absent");
+                let ua = headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                json!({"bytes":request_bytes,"stream":value("stream").and_then(|v|v.as_bool()),"effort":effort,"tools":value("tools").and_then(|v|v.as_array().map(Vec::len)),"previous_response":pinned,"ua":if ua.contains("codex"){"codex"}else if ua.contains("mozilla"){"browser"}else if ua.is_empty(){"absent"}else{"other"}})
+            } else {
+                serde_json::Value::Null
+            };
             let mut request = app
                 .upstream_client(cfg.use_system_proxy)
                 .post(config::responses_url(&channel.base_url))
@@ -272,6 +330,7 @@ async fn responses_inner(
                 }
             }
             trace.attempt(channel, key);
+            let attempt_started = std::time::Instant::now();
             let result = tokio::time::timeout_at(
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(600)),
                 request.send(),
@@ -279,13 +338,33 @@ async fn responses_inner(
             .await;
             let response = match result {
                 Ok(Ok(r)) => r,
-                _ => {
+                failure => {
+                    if cfg.diagnostics_enabled {
+                        let category = match failure {
+                            Err(_) => "deadline",
+                            Ok(Err(e)) if e.is_timeout() => "timeout",
+                            Ok(Err(e)) if e.is_connect() => "connect_or_tls",
+                            _ => "transport",
+                        };
+                        app.state.lock().await.diagnostic(true,"upstream_transport",json!({"rid":trace.id(),"key":key.id,"category":category,"ms":attempt_started.elapsed().as_millis(),"request":features}).to_string());
+                    }
                     trace.retry("connection_or_timeout");
                     fail(&app, &cfg, &key.id, &channel.name, 0).await;
                     continue;
                 }
             };
             let status = response.status();
+            let header_ms = attempt_started.elapsed().as_millis();
+            let gateway = diagnostic_gateway(response.headers());
+            let response_headers = if cfg.diagnostics_enabled {
+                response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| json!([k.as_str(), String::from_utf8_lossy(v.as_bytes())]))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             trace.status(status.as_u16());
             if !status.is_success() {
                 let retry = response
@@ -310,6 +389,21 @@ async fn responses_inner(
                     trace.usage(crate::usage::Tokens::parse(&v["usage"]));
                 }
                 let classified = classify(status.as_u16(), &raw);
+                if cfg.diagnostics_enabled {
+                    let captured = &raw[..raw.len().min(262144)];
+                    let record = json!({"at":chrono::Utc::now().to_rfc3339(),"rid":trace.id(),"channel_id":channel.id,"key_id":key.id,"http":status.as_u16(),"header_ms":header_ms,"total_ms":attempt_started.elapsed().as_millis(),"request":features,"response_headers":response_headers,"body":String::from_utf8_lossy(captured),"body_bytes":raw.len(),"captured_bytes":captured.len(),"truncated":captured.len()!=raw.len()});
+                    if app.record_upstream_error(record).await.is_err() {
+                        app.state.lock().await.event(
+                            "diagnostic_error",
+                            "上游错误原文写盘失败，请检查数据目录空间和权限".into(),
+                        );
+                    }
+                    let detail = json!({"rid":trace.id(),"key":key.id,"http":status.as_u16(),"class":classified,"header_ms":header_ms,"total_ms":attempt_started.elapsed().as_millis(),"response_bytes":raw.len(),"gateway":gateway,"error":diagnostic_error(&raw),"request":features});
+                    app.state
+                        .lock()
+                        .await
+                        .diagnostic(true, "upstream_http", detail.to_string());
+                }
                 if classified == 400 {
                     return (status, [("content-type", "application/json")], raw).into_response();
                 }
@@ -691,6 +785,24 @@ pub use crate::errors::classify;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_metadata_never_copies_upstream_secrets() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("server", "openresty secret-value".parse().unwrap());
+        headers.insert("x-request-id", "private-id".parse().unwrap());
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let gateway = super::diagnostic_gateway(&headers).to_string();
+        let error = super::diagnostic_error(
+            br#"{"error":{"message":"upstream timeout private-body sk-secret"}}"#,
+        )
+        .to_string();
+        assert!(gateway.contains("openresty"));
+        assert!(error.contains("timeout"));
+        for secret in ["secret-value", "private-id", "private-body", "sk-secret"] {
+            assert!(!gateway.contains(secret));
+            assert!(!error.contains(secret));
+        }
+    }
     use super::*;
     #[test]
     fn real_supplier_errors() {

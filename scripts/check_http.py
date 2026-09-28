@@ -258,6 +258,11 @@ def main():
    assert key['confirmation_failures']>=1 and key['probe_attempts']==0 and key['suspect'] and not key['service_failed'],key
 
    # Non-2xx probe bodies must distinguish credentials/quota from service faults.
+   cfg['models'][0]['channels']=[channel('probe-503','bad')];assert request('/admin/api/save',cfg)[0]==200
+   for _ in range(2):
+    assert request('/admin/api/verify',{'channel_id':'probe-503'})[0]==200
+   key=json.loads(request('/admin/api/state')[1])['state']['keys']['probe-503-key']
+   assert key['suspect'] and not key['service_failed'] and key['confirmation_failures']>=1,key
    for prefix,flag in [('quota403','request_exhausted'),('auth403','credential_failed'),('weekly429','request_exhausted')]:
     cfg['models'][0]['channels']=[channel(prefix,prefix)];assert request('/admin/api/save',cfg)[0]==200
     assert request('/admin/api/verify',{'channel_id':prefix})[0]==200
@@ -337,7 +342,19 @@ def main():
    unlocked=json.loads(request('/admin/api/state')[1])['state']['keys']['recover-key'];assert unlocked['cooldown_until']==0 and not unlocked['service_failed']
    assert request('/v1/responses',payload,True)[0]==200
    diagnostics=json.loads(request('/admin/api/state')[1])['state']['diagnostics']
-   assert {'service_probe','service_state','quality_check','no_available_channel'} <= {d['kind'] for d in diagnostics}
+   error_records=[json.loads(line) for line in pathlib.Path(temp,'upstream-errors.jsonl').read_text().splitlines()]
+   exact=next(r for r in error_records if r['http']==429 and 'insufficient_quota' in r['body'])
+   assert exact['body']=='{"error":{"code":"insufficient_quota"}}'
+   assert exact['body'] and not exact['truncated'] and exact['captured_bytes']==exact['body_bytes']
+   assert any(name.lower()=='content-length' for name,value in exact['response_headers'])
+   probe_errors=[r for r in error_records if r.get('source')=='service_probe']
+   quota_probe=next(r for r in probe_errors if r['key_id']=='quota403-key')
+   assert quota_probe['http']==403 and json.loads(quota_probe['body'])['error']['code']=='insufficient_balance'
+   assert quota_probe['body_complete'] and quota_probe['header_ms'] is not None
+   assert quota_probe['captured_bytes']==quota_probe['body_bytes'] and not quota_probe['truncated']
+   assert {'service_probe','service_state','quality_check','no_available_channel','upstream_http'} <= {d['kind'] for d in diagnostics}
+   http_details=[json.loads(d['message']) for d in diagnostics if d['kind']=='upstream_http']
+   assert any(d['http']==503 and d['request']['bytes']>0 and d['rid'].startswith('fr_') for d in http_details)
    assert all(secret not in json.dumps(diagnostics) for secret in ('upstream-secret','monitor-key','company-secret','test-password'))
 
    # Legacy exhausted state resumes automatically, confirms twice, then routes.

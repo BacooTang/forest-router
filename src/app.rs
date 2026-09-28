@@ -32,6 +32,32 @@ impl Drop for CheckGuard<'_> {
     }
 }
 impl App {
+    /// Keep upstream failure evidence separately from the bounded state snapshot.
+    /// Two rotating files, at most roughly 32 MiB total. No request body is copied.
+    pub async fn record_upstream_error(&self, record: serde_json::Value) -> Result<(), String> {
+        let _guard = self.persist.lock().await;
+        let dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let path = dir.join("upstream-errors.jsonl");
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() >= 16 * 1024 * 1024) {
+                std::fs::rename(&path, dir.join("upstream-errors.previous.jsonl"))
+                    .map_err(|e| e.to_string())?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path).map_err(|e| e.to_string())?;
+            serde_json::to_writer(&mut file, &record).map_err(|e| e.to_string())?;
+            file.write_all(b"\n").map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
     pub fn upstream_client(&self, system_proxy: bool) -> reqwest::Client {
         if system_proxy {
             self.system_client.read().unwrap().clone()

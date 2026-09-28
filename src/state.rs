@@ -81,10 +81,15 @@ impl State {
         while self.diagnostics.len() >= 2000 {
             self.diagnostics.pop_front();
         }
+        let limit = if matches!(kind, "upstream_http" | "upstream_transport") {
+            1536
+        } else {
+            512
+        };
         self.diagnostics.push_back(Event {
             at: now,
             kind: kind.into(),
-            message: message.chars().take(512).collect(),
+            message: message.chars().take(limit).collect(),
         });
     }
     pub fn event(&mut self, kind: &str, message: String) {
@@ -112,6 +117,23 @@ impl State {
     }
 }
 impl KeyState {
+    /// A local deadline/observation bound is not evidence of an upstream outage.
+    /// Do not unlock an existing outage, or block a previously eligible key.
+    pub fn probe_inconclusive(&mut self, now: i64, next_at: i64) {
+        self.revision += 1;
+        self.service_next_at = next_at.max(now + 15);
+        self.recovery_successes = 0;
+        self.confirmation_failures = 0;
+        if self.service_failed {
+            self.retry_at = self.service_next_at;
+            self.reason = "探测等待超时或达到观察上限，本次无结论；保留原故障状态并自动复查".into();
+        } else {
+            if self.suspect {
+                self.confirmation_at = self.service_next_at;
+            }
+            self.reason = "探测等待超时或达到观察上限，本次无结论；保持可用并自动复查".into();
+        }
+    }
     pub fn service_due(&self, now: i64) -> bool {
         if self.credential_failed || self.allowance.as_ref().is_some_and(|a| a.unavailable(now)) {
             return false;
@@ -230,6 +252,28 @@ impl KeyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inconclusive_probes_never_quarantine_or_unlock() {
+        let mut s = KeyState::default();
+        s.suspect_service(100);
+        s.confirmation_failures = 2;
+        for now in [200, 400, 600, 800] {
+            s.probe_inconclusive(now, now + 120);
+            assert!(s.eligible(now));
+            assert!(!s.recovery_due(now));
+            assert_eq!(s.confirmation_failures, 0);
+        }
+        s.fail_service(900);
+        s.probe_result(930, true);
+        s.probe_inconclusive(1000, 1120);
+        assert!(!s.eligible(1200));
+        assert_eq!(s.recovery_successes, 0);
+        assert!(s.recovery_due(1120));
+        s.credential_failed = true;
+        s.probe_inconclusive(1200, 1320);
+        assert!(!s.eligible(1400));
+        assert!(!s.recovery_due(1400));
+    }
     #[test]
     fn first_incident_confirmation_and_parallel_failures() {
         let mut s = KeyState::default();
