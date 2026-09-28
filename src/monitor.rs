@@ -92,6 +92,7 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         q.next_at = q.next_at.min(now + delay);
     }
     q.error = outcome.err().unwrap_or_default();
+    let event_error = q.error.clone();
     while q.history.len() >= 72 {
         q.history.pop_front();
     }
@@ -113,12 +114,18 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         state.event(
             "quality",
             format!(
-                "监控 {}：{}",
+                "监控 {} · Chat Completions · {:.2}秒：{}{}",
                 m.name,
+                started.elapsed().as_secs_f64(),
                 match verdict {
                     "healthy" => "满血",
                     "degraded" => "降智",
                     _ => "检测异常，保留未过期的上次结论",
+                },
+                if event_error.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n具体原因：{event_error}")
                 }
             ),
         );

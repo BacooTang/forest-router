@@ -350,6 +350,16 @@ async fn responses_inner(
                     }
                     trace.retry("connection_or_timeout");
                     fail(&app, &cfg, &key.id, &channel.name, 0).await;
+                    let current = app.config.read().await;
+                    if Arc::ptr_eq(&current, &cfg) {
+                        let mut state = app.state.lock().await;
+                        let impact = state
+                            .keys
+                            .get(&key.id)
+                            .map(|s| s.service_event_status(chrono::Utc::now().timestamp()))
+                            .unwrap_or_default();
+                        state.event("service",format!("{} / {} · 业务请求 · 未收到HTTP响应 · {:.2}秒\n{}\n连接、TLS或发送过程失败/等待超时；请求ID：{}",channel.name,key.label,attempt_started.elapsed().as_secs_f64(),impact,trace.id()));
+                    }
                     continue;
                 }
             };
@@ -422,6 +432,18 @@ async fn responses_inner(
                     && let Some(s) = app.state.lock().await.keys.get_mut(&key.id)
                 {
                     s.retry_at = chrono::Utc::now().timestamp() + retry;
+                }
+                {
+                    let current = app.config.read().await;
+                    if Arc::ptr_eq(&current, &cfg) {
+                        let mut state = app.state.lock().await;
+                        let impact = state
+                            .keys
+                            .get(&key.id)
+                            .map(|s| s.service_event_status(chrono::Utc::now().timestamp()))
+                            .unwrap_or_default();
+                        state.event("service", format!("{} / {} · 业务请求 · HTTP {} · {:.2}秒\n{}\n请求ID：{}\n上游原文摘要：{}",channel.name,key.label,status.as_u16(),attempt_started.elapsed().as_secs_f64(),impact,trace.id(),crate::upstream::error_excerpt(&raw)));
+                    }
                 }
                 continue;
             }

@@ -62,6 +62,49 @@ impl Default for ProbeReport {
     }
 }
 impl ProbeReport {
+    fn event_message(&self, c: &Channel, k: &Key, manual: bool, status: &str) -> String {
+        let source = if manual {
+            "手动服务验证"
+        } else {
+            "自动服务探测"
+        };
+        let stage = match self.stage {
+            "awaiting_headers" => "等待响应头",
+            "sse" => "读取SSE流",
+            "json" => "读取JSON响应",
+            "http_error_body" => "读取上游错误正文",
+            _ => self.stage,
+        };
+        let http = self
+            .http
+            .map(|s| format!("HTTP {s}"))
+            .unwrap_or_else(|| "未收到HTTP响应".into());
+        let cause = match self.detail.as_str() {
+            "response_headers_deadline" => "等待响应头达到本地时限，本次无结论",
+            "response_idle_deadline" => "连续无数据达到本地时限，本次无结论",
+            "probe_total_deadline" => "探测总时长达到本地时限，本次无结论",
+            "probe_byte_limit" | "json_or_error_body_limit" => "达到本地观察大小上限",
+            "sse_missing_terminal" => "流已结束，但缺少完成事件",
+            "sse_error_frame" => "上游返回流内错误",
+            "upstream_http_error" => "上游明确报错",
+            "invalid_response_or_error_envelope" => "响应结构异常或包含错误",
+            "" => "完成",
+            other => other,
+        };
+        let mut message = format!(
+            "{} / {} · {source} · {http} · {:.2}秒\n{status}\n阶段：{stage}；{cause}",
+            c.name,
+            k.label,
+            self.total_ms as f64 / 1000.0
+        );
+        if self.outcome != Probe::Healthy && !self.body.is_empty() {
+            message.push_str(&format!(
+                "\n上游原文摘要：{}",
+                upstream::error_excerpt(&self.body)
+            ));
+        }
+        message
+    }
     fn capture(&mut self, chunk: &[u8]) {
         self.bytes += chunk.len();
         // Keep the tail: SSE error frames often follow a large progress frame.
@@ -254,6 +297,8 @@ pub async fn check(
     let suspect_before = s.suspect;
     if matches!(outcome, Probe::Inconclusive) {
         s.probe_inconclusive(now, s.service_next_at);
+        let event = report.event_message(c, k, manual, &s.service_event_status(now));
+        state.event("check", event);
         state.diagnostic(
             cfg.diagnostics_enabled,
             "service_state",
@@ -281,12 +326,8 @@ pub async fn check(
         s.retry_at = now + delay;
         s.revision += 1;
         s.reason = "恢复检查遇到限流，延后检查，不消耗故障探测预算".into();
-        if manual {
-            state.event(
-                "check",
-                format!("{} / {}：上游限流，请稍后验证", c.name, k.label),
-            );
-        }
+        let event = report.event_message(c, k, manual, &s.service_event_status(now));
+        state.event("rate_limit", event);
         return true;
     }
     if manual && ok {
@@ -359,6 +400,7 @@ pub async fn check(
         };
     }
     let recovered = ok && (failed_before || suspect_before) && !s.service_failed && !s.suspect;
+    let event = report.event_message(c, k, manual, &s.service_event_status(now));
     let detail = format!(
         "key={} failed={} suspect={} attempts={} successes={} retry_at={} routine_at={}",
         k.id,
@@ -379,28 +421,21 @@ pub async fn check(
             ),
         );
     }
-    if recovered {
-        state.event("service", format!("{} / {}：服务恢复", c.name, k.label));
-    }
-    if new_failure {
-        state.event("service", format!("{} / {}：服务验证失败", c.name, k.label));
-        if !cfg.webhook.is_empty() {
-            state.notify(format!(
-                "服务中断：{} / {}，将自动使用后续可用渠道。",
-                c.name, k.label
-            ));
-        }
-    }
-    if manual && !new_failure && !recovered {
+    if !ok || manual || recovered || failed_before {
         state.event(
-            "check",
-            format!(
-                "{} / {}：重新验证{}",
-                c.name,
-                k.label,
-                if ok { "成功" } else { "失败" }
-            ),
+            "service",
+            if recovered {
+                format!("服务恢复 · {event}")
+            } else {
+                event
+            },
         );
+    }
+    if new_failure && !cfg.webhook.is_empty() {
+        state.notify(format!(
+            "服务中断：{} / {}，将自动使用后续可用渠道。",
+            c.name, k.label
+        ));
     }
     true
 }
@@ -408,6 +443,44 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn event_explains_real_http_cause_and_local_deadline() {
+        let c: Channel = serde_json::from_value(json!({"id":"c","name":"渠道","base_url":"http://localhost","upstream_model":"test","adapter":"sub2_api","enabled":true,"keys":[]})).unwrap();
+        let k = Key {
+            id: "k".into(),
+            label: "主Key".into(),
+            secret: "not-for-events".into(),
+            enabled: true,
+        };
+        let mut r = ProbeReport {
+            outcome: Probe::Definite(503),
+            http: Some(503),
+            total_ms: 285,
+            stage: "http_error_body",
+            detail: "upstream_http_error".into(),
+            body: br#"{"error":{"message":"Service temporarily unavailable"}}"#.to_vec(),
+            ..Default::default()
+        };
+        let event = r.event_message(&c, &k, false, "确认中，暂不隔离");
+        for text in [
+            "HTTP 503",
+            "0.28秒",
+            "Service temporarily unavailable",
+            "自动服务探测",
+            "暂不隔离",
+        ] {
+            assert!(event.contains(text), "{event}");
+        }
+        assert!(!event.contains(&k.secret));
+        r.outcome = Probe::Inconclusive;
+        r.http = None;
+        r.body.clear();
+        r.detail = "response_headers_deadline".into();
+        assert!(
+            r.event_message(&c, &k, false, "保留状态")
+                .contains("本次无结论")
+        );
+    }
     use axum::{Router, body::Body, response::Response, routing::post};
 
     async fn fixture(

@@ -117,6 +117,47 @@ impl State {
     }
 }
 impl KeyState {
+    pub fn service_event_status(&self, now: i64) -> String {
+        let status = if self.credential_failed {
+            "凭证失效，暂停使用".to_owned()
+        } else if self.allowance.as_ref().is_some_and(|a| a.unavailable(now)) {
+            "额度耗尽或到期，暂停使用".to_owned()
+        } else if self.service_failed || self.probe_exhausted {
+            format!("服务已隔离，恢复连续成功 {} 次", self.recovery_successes)
+        } else if self.retry_at > now {
+            "等待限流结束，暂时跳过".to_owned()
+        } else if self.suspect {
+            format!(
+                "服务异常确认中，暂不隔离；确认失败 {} 次，已持续 {} 秒（隔离需至少3次且60秒）",
+                self.confirmation_failures,
+                now - self.last_incident.unwrap_or(now)
+            )
+        } else {
+            "服务状态未隔离；是否可路由仍取决于质量、额度及开关".to_owned()
+        };
+        let next = if self.service_failed || self.probe_exhausted || self.retry_at > now {
+            self.retry_at
+        } else if self.suspect {
+            self.confirmation_at.max(self.retry_at)
+        } else {
+            self.service_next_at
+        };
+        if !self.credential_failed
+            && !self.allowance.as_ref().is_some_and(|a| a.unavailable(now))
+            && next > 0
+        {
+            let time = chrono::DateTime::from_timestamp(next, 0)
+                .map(|d| {
+                    d.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                        .format("%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            format!("{status}；下次检查不早于 {time}（上海时间，可能排队）")
+        } else {
+            status
+        }
+    }
     /// A local deadline/observation bound is not evidence of an upstream outage.
     /// Do not unlock an existing outage, or block a previously eligible key.
     pub fn probe_inconclusive(&mut self, now: i64, next_at: i64) {

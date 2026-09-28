@@ -348,6 +348,10 @@ def main():
    assert exact['body'] and not exact['truncated'] and exact['captured_bytes']==exact['body_bytes']
    assert any(name.lower()=='content-length' for name,value in exact['response_headers'])
    probe_errors=[r for r in error_records if r.get('source')=='service_probe']
+   event_messages=[e['message'] for e in json.loads(request('/admin/api/state')[1])['state']['events']]
+   assert any('自动服务探测' in e or '手动服务验证' in e for e in event_messages)
+   assert any('手动服务验证' in e and 'HTTP 403' in e and 'insufficient_balance' in e for e in event_messages)
+   assert any('业务请求' in e and '请求ID：fr_' in e and 'HTTP ' in e for e in event_messages)
    quota_probe=next(r for r in probe_errors if r['key_id']=='quota403-key')
    assert quota_probe['http']==403 and json.loads(quota_probe['body'])['error']['code']=='insufficient_balance'
    assert quota_probe['body_complete'] and quota_probe['header_ms'] is not None

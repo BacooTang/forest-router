@@ -7,6 +7,21 @@ use serde_json::Value;
 use std::time::Duration;
 pub const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
+/// A readable excerpt for the admin event list; full evidence stays in JSONL.
+pub fn error_excerpt(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "上游未返回错误正文".into();
+    }
+    let mut chars = compact.chars();
+    let mut excerpt: String = chars.by_ref().take(400).collect();
+    if chars.next().is_some() {
+        excerpt.push_str("…（摘要截断；完整内容见原文日志）");
+    }
+    excerpt
+}
+
 /// Build a gateway initiated request with the browser compatible headers required by some WAFs.
 /// Business proxy requests must keep using their original client headers.
 pub fn control_request(
