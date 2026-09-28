@@ -48,7 +48,11 @@ impl App {
     }
     pub async fn persist(&self) -> Result<(), String> {
         let _guard = self.persist.lock().await;
-        let mut snapshot = self.state.lock().await.clone();
+        let mut snapshot = {
+            let mut state = self.state.lock().await;
+            state.prune_diagnostics(chrono::Utc::now().timestamp());
+            state.clone()
+        };
         snapshot.telemetry = self.metrics.lock().unwrap().snapshot();
         let path = self.data_dir.join("state.json");
         tokio::task::spawn_blocking(move || crate::storage::write_json(&path, &snapshot))

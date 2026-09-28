@@ -82,8 +82,14 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
     q.checked_at = now;
     q.next_at = next(now, &cfg.monitor_schedule);
     if outcome.is_ok() {
+        q.error_streak = 0;
         q.last_definite = verdict.into();
         q.valid_until = q.next_at + 300;
+    } else {
+        q.error_streak = q.error_streak.saturating_add(1);
+        // Retry uncertain results without extending the last definite verdict.
+        let delay = (60_i64 * (1_i64 << q.error_streak.saturating_sub(1).min(3))).min(300);
+        q.next_at = q.next_at.min(now + delay);
     }
     q.error = outcome.err().unwrap_or_default();
     while q.history.len() >= 72 {
@@ -93,6 +99,16 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         at: now,
         verdict: verdict.into(),
     });
+    let detail = format!(
+        "monitor={} verdict={} valid_until={} next_at={} error_streak={} elapsed_ms={}",
+        m.id,
+        verdict,
+        q.valid_until,
+        q.next_at,
+        q.error_streak,
+        started.elapsed().as_millis()
+    );
+    state.diagnostic(cfg.diagnostics_enabled, "quality_check", detail);
     if was != verdict {
         state.event(
             "quality",
@@ -300,6 +316,20 @@ mod tests {
                 next(t, &crate::config::default_monitor_schedule()),
                 chrono::DateTime::parse_from_rfc3339(e).unwrap().timestamp()
             );
+        }
+    }
+    #[test]
+    fn service_schedule_uses_shanghai_periods_and_cross_midnight() {
+        let periods = crate::config::default_service_schedule();
+        for (from, to) in [
+            ("2026-09-27T09:00:00+08:00", "2026-09-27T09:02:00+08:00"),
+            ("2026-09-27T23:00:00+08:00", "2026-09-27T23:05:00+08:00"),
+            ("2026-09-27T04:00:00+08:00", "2026-09-27T04:10:00+08:00"),
+            ("2026-09-27T07:00:00+08:00", "2026-09-27T07:05:00+08:00"),
+            ("2026-09-27T23:59:00+08:00", "2026-09-28T00:00:00+08:00"),
+        ] {
+            let ts = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+            assert_eq!(next(ts(from), &periods), ts(to));
         }
     }
 }

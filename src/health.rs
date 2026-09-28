@@ -11,7 +11,6 @@ const PROBE_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 pub enum Probe {
     Healthy,
     Failed,
-    Busy,
     Definite(u16),
     Throttled(i64),
 }
@@ -26,11 +25,10 @@ async fn probe_result(app: &App, c: &Channel, k: &Key) -> Probe {
             .json(&json!({"model":c.upstream_model,"input":"Reply OK.","max_output_tokens":256,"reasoning":{"effort":"low"},"stream":true}))
             .send().await.ok()?;
         let status = response.status().as_u16();
-        if status == 504 { return Some(Probe::Busy); }
         if !response.status().is_success(){
             let delay=response.headers().get("retry-after").and_then(|h|h.to_str().ok()).and_then(|s|s.parse::<i64>().ok()).unwrap_or(300).clamp(60,3600);
-            let body = upstream::bounded_json(response).await.ok();
-            let class = crate::errors::classify(status, &body.and_then(|v| serde_json::to_vec(&v).ok()).unwrap_or_default());
+            let body = upstream::bounded_body(response).await.unwrap_or_default();
+            let class = crate::errors::classify(status, &body);
             return Some(if matches!(class, 401 | 402) { Probe::Definite(class) } else if class == 429 { Probe::Throttled(delay) } else if status >= 500 && status != 504 { Probe::Definite(status) } else { Probe::Failed });
         }
         if response.headers().get("content-type").and_then(|h|h.to_str().ok()).is_some_and(|h|h.starts_with("text/event-stream")) {
@@ -63,7 +61,7 @@ pub async fn check(
     reset: bool,
     manual: bool,
 ) -> bool {
-    let Some(_guard) = app.begin(format!("service:{}", k.id)) else {
+    let Some(_guard) = app.begin(format!("key-check:{}", k.id)) else {
         return false;
     };
     let Ok(_permit) = app.checks.clone().acquire_owned().await else {
@@ -76,6 +74,7 @@ pub async fn check(
         .keys
         .get(&k.id)
         .map_or(0, |s| s.revision);
+    let started = std::time::Instant::now();
     let outcome = probe_result(app, c, k).await;
     let ok = matches!(outcome, Probe::Healthy);
     let current = app.config.read().await;
@@ -84,29 +83,33 @@ pub async fn check(
     }
     let now = chrono::Utc::now().timestamp();
     let mut state = app.state.lock().await;
+    let category = match outcome {
+        Probe::Healthy => "healthy",
+        Probe::Failed => "failed",
+        Probe::Definite(401) => "credential",
+        Probe::Definite(402) => "quota",
+        Probe::Definite(_) => "http_service_error",
+        Probe::Throttled(_) => "throttled",
+    };
+    let stale = state.keys.get(&k.id).map_or(0, |s| s.revision) != revision;
+    state.diagnostic(
+        cfg.diagnostics_enabled,
+        "service_probe",
+        format!(
+            "key={} result={} elapsed_ms={} manual={} stale={}",
+            k.id,
+            category,
+            started.elapsed().as_millis(),
+            manual,
+            stale
+        ),
+    );
     let s = state.keys.entry(k.id.clone()).or_default();
     if s.revision != revision {
         return false;
     }
-    if matches!(outcome, Probe::Busy) {
-        // Do not count congestion as either recovery or service failure.
-        if s.suspect {
-            s.confirmation_at = now + 60;
-        } else if s.service_failed {
-            s.retry_at = now + 60;
-        }
-        s.revision += 1;
-        if manual {
-            state.event(
-                "check",
-                format!(
-                    "{} / {}：HTTP 504，上游繁忙，本次验证无结论",
-                    c.name, k.label
-                ),
-            );
-        }
-        return true;
-    }
+    s.service_next_at = crate::monitor::next(now, &cfg.service_schedule);
+    let exhausted_before = s.probe_exhausted;
     let failed_before = s.service_failed;
     let suspect_before = s.suspect;
     if manual {
@@ -121,6 +124,7 @@ pub async fn check(
         s.last_recovery_success = now - 60;
     }
     if let Probe::Throttled(delay) = outcome {
+        s.recovery_successes = 0;
         s.retry_at = now + delay;
         s.revision += 1;
         s.reason = "恢复检查遇到限流，延后检查，不消耗故障探测预算".into();
@@ -182,19 +186,42 @@ pub async fn check(
         }
         failed
     } else if !s.service_failed {
-        s.reason = "最小 Responses 验证失败".into();
-        s.fail_service(now)
+        // A routine probe failure alone must not evict a working channel.
+        s.reason = "服务探测异常，自动确认中".into();
+        s.suspect_service(now)
     } else {
         s.probe_result(now, false);
         false
     };
     let exhausted = s.probe_exhausted;
+    if s.service_failed
+        && !ok
+        && !s.credential_failed
+        && !s.allowance.as_ref().is_some_and(|a| a.unavailable(now))
+    {
+        s.retry_at = if s.probe_exhausted {
+            s.service_next_at
+        } else {
+            s.retry_at.min(s.service_next_at)
+        };
+    }
     let recovered = ok && (failed_before || suspect_before) && !s.service_failed && !s.suspect;
-    if exhausted {
+    let detail = format!(
+        "key={} failed={} suspect={} attempts={} successes={} retry_at={} routine_at={}",
+        k.id,
+        s.service_failed,
+        s.suspect,
+        s.probe_attempts,
+        s.recovery_successes,
+        s.retry_at,
+        s.service_next_at
+    );
+    state.diagnostic(cfg.diagnostics_enabled, "service_state", detail);
+    if exhausted && !exhausted_before {
         state.event(
             "service",
             format!(
-                "{} / {}：恢复探测达到12次上限，已停止自动探测",
+                "{} / {}：快速恢复探测达到12次，继续按服务时间段自动复查",
                 c.name, k.label
             ),
         );

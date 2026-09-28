@@ -506,6 +506,42 @@ async fn responses_inner(
             });
         }
     }
+    if cfg.diagnostics_enabled {
+        let now = chrono::Utc::now().timestamp();
+        let mut state = app.state.lock().await;
+        let detail = route
+            .channels
+            .iter()
+            .take(8)
+            .map(|c| {
+                let mut blocked = [0usize; 5];
+                for k in &c.keys {
+                    if !k.enabled { blocked[0] += 1; continue; }
+                    if let Some(s) = state.keys.get(&k.id) {
+                        blocked[1] += usize::from(s.credential_failed);
+                        blocked[2] += usize::from(s.allowance.as_ref().is_some_and(|a| a.unavailable(now)));
+                        blocked[3] += usize::from(s.service_failed || s.probe_exhausted);
+                        blocked[4] += usize::from(s.retry_at > now);
+                    }
+                }
+                let quality_ok = c.monitor_id.as_ref().is_none_or(|id| state.quality.get(id).is_some_and(|q| q.last_definite == "healthy" && q.valid_until > now));
+                let eligible = c
+                    .keys
+                    .iter()
+                    .filter(|k| k.enabled && state.keys.get(&k.id).is_none_or(|s| s.eligible(now)))
+                    .count();
+                format!(
+                    "channel={} enabled={} eligible_keys={} ready={} quality_ok={} blocked[disabled,credential,quota,service,wait]={:?}",
+                    c.id,
+                    c.enabled,
+                    eligible,
+                    state.channel_ready(c, now), quality_ok, blocked
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        state.diagnostic(true, "no_available_channel", detail);
+    }
     error(
         StatusCode::SERVICE_UNAVAILABLE,
         "no_available_channel",
@@ -559,10 +595,8 @@ async fn record_route(app: &App, cfg: &Arc<config::Config>, model: &str, id: &st
 }
 
 async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, status: u16) {
-    // Gateway queue timeouts are request failures, not evidence of a bad Key.
-    if status == 504 {
-        return;
-    }
+    // A single gateway timeout is inconclusive; persistent ones use the same
+    // bounded confirmation window as transport errors.
     let cfg = app.config.read().await;
     if !Arc::ptr_eq(&cfg, expected) {
         return;

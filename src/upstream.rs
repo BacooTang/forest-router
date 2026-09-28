@@ -37,16 +37,22 @@ pub async fn bounded_json(response: reqwest::Response) -> Result<Value, String> 
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status().as_u16()));
     }
+    let data = bounded_body(response).await?;
+    serde_json::from_slice(&data).map_err(|_| "接口未返回有效JSON".into())
+}
+
+/// Also reads non-success responses so callers can classify their error envelope.
+pub async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, String> {
     let mut stream = response.bytes_stream();
     let mut data = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| "读取响应失败")?;
         if data.len() + chunk.len() > 262144 {
-            return Err("额度响应超过256KiB".into());
+            return Err("响应超过256KiB".into());
         }
         data.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&data).map_err(|_| "接口未返回有效JSON".into())
+    Ok(data)
 }
 
 pub async fn monitor_json(response: reqwest::Response) -> Result<Value, String> {

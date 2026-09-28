@@ -283,6 +283,15 @@ pub async fn save(State(app): State<Arc<App>>, h: HeaderMap, Json(mut v): Json<V
             }
         }
         state.reconcile(&cfg);
+        if old.service_schedule != cfg.service_schedule {
+            let now = chrono::Utc::now().timestamp();
+            for s in state.keys.values_mut() {
+                s.service_next_at = crate::monitor::next(now, &cfg.service_schedule);
+                if s.service_failed && !s.credential_failed && s.probe_exhausted {
+                    s.retry_at = s.retry_at.min(s.service_next_at);
+                }
+            }
+        }
         if old.monitor_schedule != cfg.monitor_schedule {
             let now = chrono::Utc::now().timestamp();
             for q in state.quality.values_mut() {

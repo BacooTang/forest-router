@@ -65,14 +65,7 @@ pub fn spawn(app: Arc<App>) {
                                 .iter()
                                 .filter(|k| k.enabled)
                                 .filter(|k| {
-                                    state.keys.get(&k.id).is_some_and(|s| {
-                                        (s.service_failed || s.suspect)
-                                            && !s.probe_exhausted
-                                            && s.retry_at <= now
-                                            && (!s.suspect || s.confirmation_at <= now)
-                                            && !s.credential_failed
-                                            && !s.allowance.as_ref().is_some_and(|a| a.exhausted)
-                                    })
+                                    state.keys.get(&k.id).is_none_or(|s| s.service_due(now))
                                 })
                                 .map(|k| (c.clone(), k.clone()))
                                 .collect::<Vec<_>>()
@@ -125,7 +118,9 @@ pub async fn balance_check(
     c: &Channel,
     k: &Key,
 ) -> bool {
-    let Some(_guard) = app.begin(format!("balance:{}", k.id)) else {
+    // Serialize quota and service checks for a key: neither should repeatedly
+    // invalidate the other's result through their shared state revision.
+    let Some(_guard) = app.begin(format!("key-check:{}", k.id)) else {
         return false;
     };
     let Ok(_permit) = app.checks.clone().acquire_owned().await else {
@@ -180,6 +175,14 @@ pub async fn balance_check(
             s.detected = Some(detected);
             s.allowance = Some(allowance);
             s.balance_error = None;
+            if old == Some(true) && !exhausted {
+                if s.reason == "额度耗尽" {
+                    s.reason.clear();
+                }
+                if s.service_failed && !s.credential_failed {
+                    s.retry_at = s.retry_at.min(s.balance_checked + 5);
+                }
+            }
             // Balance access alone does not prove generation credentials/permissions recovered.
             if old.is_some_and(|o| o != exhausted) {
                 let message = format!(

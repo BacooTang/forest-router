@@ -8,6 +8,8 @@ pub struct Config {
     #[serde(default)]
     pub use_system_proxy: bool,
     #[serde(default)]
+    pub diagnostics_enabled: bool,
+    #[serde(default)]
     pub employee_keys: Vec<EmployeeKey>,
     pub admin_password_hash: String,
     #[serde(default)]
@@ -20,6 +22,32 @@ pub struct Config {
     pub monitors: Vec<Monitor>,
     #[serde(default = "default_monitor_schedule")]
     pub monitor_schedule: Vec<MonitorPeriod>,
+    #[serde(default = "default_service_schedule")]
+    pub service_schedule: Vec<MonitorPeriod>,
+}
+pub fn default_service_schedule() -> Vec<MonitorPeriod> {
+    vec![
+        MonitorPeriod {
+            start: 540,
+            end: 1380,
+            interval_minutes: 2,
+        },
+        MonitorPeriod {
+            start: 1380,
+            end: 240,
+            interval_minutes: 5,
+        },
+        MonitorPeriod {
+            start: 240,
+            end: 420,
+            interval_minutes: 10,
+        },
+        MonitorPeriod {
+            start: 420,
+            end: 540,
+            interval_minutes: 5,
+        },
+    ]
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MonitorPeriod {
@@ -145,6 +173,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<(), String> {
         validate_monitor_schedule(&self.monitor_schedule)?;
+        validate_monitor_schedule(&self.service_schedule)?;
         let mut ids = HashSet::from(["master".to_string()]);
         let mut secrets = HashSet::from([self.api_key.clone()]);
         for k in &self.employee_keys {

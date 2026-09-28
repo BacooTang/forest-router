@@ -12,6 +12,7 @@ pub struct State {
     pub keys: HashMap<String, KeyState>,
     pub quality: HashMap<String, Quality>,
     pub events: VecDeque<Event>,
+    pub diagnostics: VecDeque<Event>,
     pub last_used: HashMap<String, String>,
     #[serde(skip)]
     pub round_robin: HashMap<String, usize>,
@@ -21,6 +22,7 @@ pub struct State {
 pub struct KeyState {
     pub detected: Option<crate::balance::Adapter>,
     pub checked: bool,
+    pub service_next_at: i64,
     pub protocol_warning: bool,
     pub request_exhausted: bool,
     pub allowance: Option<Allowance>,
@@ -46,6 +48,7 @@ pub struct KeyState {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Quality {
+    pub error_streak: u32,
     pub response_ms: Option<u64>,
     pub last_definite: String,
     pub history: VecDeque<QualityPoint>,
@@ -62,6 +65,28 @@ pub struct Event {
     pub message: String,
 }
 impl State {
+    pub fn prune_diagnostics(&mut self, now: i64) {
+        self.diagnostics.retain(|e| e.at >= now - 3 * 86400);
+        while self.diagnostics.len() > 2000 {
+            self.diagnostics.pop_front();
+        }
+    }
+    /// Fixed metadata only. Never pass upstream text, credentials or payloads.
+    pub fn diagnostic(&mut self, enabled: bool, kind: &str, message: String) {
+        if !enabled {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.prune_diagnostics(now);
+        while self.diagnostics.len() >= 2000 {
+            self.diagnostics.pop_front();
+        }
+        self.diagnostics.push_back(Event {
+            at: now,
+            kind: kind.into(),
+            message: message.chars().take(512).collect(),
+        });
+    }
     pub fn event(&mut self, kind: &str, message: String) {
         while self.events.len() >= 200 {
             self.events.pop_front();
@@ -87,6 +112,23 @@ impl State {
     }
 }
 impl KeyState {
+    pub fn service_due(&self, now: i64) -> bool {
+        if self.credential_failed || self.allowance.as_ref().is_some_and(|a| a.unavailable(now)) {
+            return false;
+        }
+        if self.service_failed || self.suspect {
+            self.recovery_due(now)
+        } else {
+            self.retry_at <= now && self.service_next_at <= now
+        }
+    }
+    pub fn recovery_due(&self, now: i64) -> bool {
+        (self.service_failed || self.suspect)
+            && self.retry_at <= now
+            && (!self.suspect || self.confirmation_at <= now)
+            && !self.credential_failed
+            && !self.allowance.as_ref().is_some_and(|a| a.unavailable(now))
+    }
     pub fn eligible(&self, now: i64) -> bool {
         !self.probe_exhausted
             && !self.service_failed
@@ -142,15 +184,26 @@ impl KeyState {
         self.revision += 1;
         self.probe_attempts = self.probe_attempts.saturating_add(1);
         if ok {
-            if self.reason == "连续恢复探测预算已耗尽，等待手动验证或修改配置"
-            {
-                self.reason.clear();
-            }
+            // A first success always gets its confirmation, even on attempt 12.
+            self.probe_exhausted = false;
+            self.reason.clear();
             if self.recovery_successes == 0 || now - self.last_recovery_success >= 60 {
                 self.recovery_successes += 1;
                 self.last_recovery_success = now;
             }
-            if self.recovery_successes >= 2 {
+            // Repeated outages require stronger evidence before re-entering priority routing.
+            let required = if self
+                .failure_cycles
+                .iter()
+                .filter(|t| now - **t < 600)
+                .count()
+                >= 2
+            {
+                3
+            } else {
+                2
+            };
+            if self.recovery_successes >= required {
                 self.service_failed = false;
                 self.probe_attempts = 0;
                 self.probe_exhausted = false;
@@ -160,6 +213,7 @@ impl KeyState {
                 return;
             }
             self.retry_at = now + 60;
+            return;
         } else {
             self.recovery_successes = 0;
             self.probe_step = (self.probe_step + 1).min(4);
@@ -167,8 +221,9 @@ impl KeyState {
         }
         if self.probe_attempts >= 12 {
             self.probe_exhausted = true;
-            self.retry_at = 0;
-            self.reason = "连续恢复探测预算已耗尽，等待手动验证或修改配置".into();
+            // Bound the rate rather than permanently abandoning recovery.
+            self.retry_at = now + 900 + i64::from(rand::random::<u8>() % 61);
+            self.reason = "服务仍异常，按服务时间段持续自动复查".into();
         }
     }
 }
@@ -244,7 +299,7 @@ mod tests {
         assert!(!state.channel_ready(&channel, 1000));
     }
     #[test]
-    fn recovery_budget_stops_permanent_failures() {
+    fn recovery_budget_slows_down_and_recovers_without_manual_reset() {
         let mut s = KeyState::default();
         s.fail_service(0);
         for _ in 0..12 {
@@ -252,8 +307,69 @@ mod tests {
             s.probe_result(now, false);
         }
         assert!(s.probe_exhausted);
-        assert_eq!(s.retry_at, 0);
+        assert!(s.retry_at > 0);
         assert!(!s.eligible(999999));
+        let due = s.retry_at;
+        assert!(!s.recovery_due(due - 1));
+        assert!(s.recovery_due(due));
+        s.probe_result(due, true);
+        assert!(!s.probe_exhausted);
+        assert!(s.service_failed);
+        s.probe_result(due + 60, true);
+        assert!(s.eligible(due + 60));
+    }
+    #[test]
+    fn last_fast_attempt_success_can_finish_confirmation() {
+        let mut s = KeyState::default();
+        s.fail_service(0);
+        s.probe_attempts = 11;
+        s.probe_result(100, true);
+        assert!(!s.probe_exhausted);
+        assert_eq!(s.retry_at, 160);
+        s.probe_result(160, true);
+        assert!(s.eligible(160));
+    }
+    #[test]
+    fn repeated_outages_require_three_successes() {
+        let mut s = KeyState::default();
+        s.fail_service(0);
+        s.probe_result(30, true);
+        s.probe_result(90, true);
+        s.fail_service(100);
+        s.probe_result(130, true);
+        s.probe_result(190, true);
+        assert!(!s.eligible(190));
+        s.probe_result(250, true);
+        assert!(s.eligible(250));
+    }
+    #[test]
+    fn routine_checks_respect_schedule_and_explicit_blockers() {
+        let mut s = KeyState {
+            service_next_at: 200,
+            ..Default::default()
+        };
+        assert!(!s.service_due(199));
+        assert!(s.service_due(200));
+        s.credential_failed = true;
+        assert!(!s.service_due(201));
+    }
+    #[test]
+    fn legacy_exhaustion_is_due_but_explicit_blockers_remain_blocked() {
+        let mut s = KeyState {
+            service_failed: true,
+            probe_exhausted: true,
+            ..Default::default()
+        };
+        assert!(s.recovery_due(100));
+        assert!(!s.eligible(100));
+        s.credential_failed = true;
+        assert!(!s.recovery_due(100));
+        s.credential_failed = false;
+        s.allowance = Some(Allowance {
+            exhausted: true,
+            ..Default::default()
+        });
+        assert!(!s.recovery_due(100));
     }
     #[test]
     fn first_probe_after_thirty_seconds_then_two_three_four_five_minutes() {
@@ -313,6 +429,21 @@ mod tests {
             s.event("test", "hello".into());
         }
         assert_eq!(s.events.len(), 200);
+    }
+    #[test]
+    fn diagnostic_toggle_retention_and_restart() {
+        let mut s = State::default();
+        s.diagnostic(false, "test", "disabled".into());
+        assert!(s.diagnostics.is_empty());
+        for _ in 0..2005 {
+            s.diagnostic(true, "test", "x".repeat(1000));
+        }
+        assert_eq!(s.diagnostics.len(), 2000);
+        assert_eq!(s.diagnostics.back().unwrap().message.len(), 512);
+        let mut restored: State = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(restored.diagnostics.len(), 2000);
+        restored.prune_diagnostics(chrono::Utc::now().timestamp() + 3 * 86400 + 1);
+        assert!(restored.diagnostics.is_empty());
     }
 }
 
@@ -394,6 +525,7 @@ impl State {
                 .any(|m| m.channels.iter().any(|c| c.id == *id))
         });
         self.events.truncate(200);
+        self.prune_diagnostics(chrono::Utc::now().timestamp());
         self.notices.truncate(200);
         for q in self.quality.values_mut() {
             while q.history.len() > 72 {

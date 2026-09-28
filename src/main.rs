@@ -95,6 +95,7 @@ async fn main() {
             listen: std::env::var("FOREST_LISTEN").unwrap_or_else(|_| "0.0.0.0:8119".into()),
             api_key,
             use_system_proxy: false,
+            diagnostics_enabled: false,
             employee_keys: vec![],
             admin_password_hash: hash,
             webhook: String::new(),
@@ -102,6 +103,7 @@ async fn main() {
             models: vec![],
             monitors: vec![],
             monitor_schedule: config::default_monitor_schedule(),
+            service_schedule: config::default_service_schedule(),
         };
         c.validate().expect("invalid bootstrap configuration");
         storage::write_json(&cfg_path, &c).expect("write initial configuration");

@@ -55,7 +55,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
    return
   if probe_throttled and self.path=='/ok/v1/responses' and d.get('input')=='Reply OK.':
    self.send_response(429);self.send_header('Retry-After','120');self.send_header('Content-Length','0');self.end_headers();return
-  variants={'/jsonauth/':(200,{'code':401,'msg':'令牌已过期或验证不正确','success':False}),'/unknown/':(200,{'success':False,'code':937,'msg':'unknown vendor error'}),'/input/':(400,{'error':{'code':'context_length_exceeded','message':'too long'}})}
+  variants={'/quota403/':(403,{'error':{'code':'insufficient_balance'}}),'/auth403/':(403,{'error':{'code':'invalid_api_key'}}),'/weekly429/':(429,{'error':{'code':'weekly_limit_exceeded'}}),'/jsonauth/':(200,{'code':401,'msg':'令牌已过期或验证不正确','success':False}),'/unknown/':(200,{'success':False,'code':937,'msg':'unknown vendor error'}),'/input/':(400,{'error':{'code':'context_length_exceeded','message':'too long'}})}
   for prefix,(status,value) in variants.items():
    if self.path.startswith(prefix):
     out=json.dumps(value).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
@@ -104,6 +104,8 @@ def main():
    assert json.loads(request('/v1/models',auth=True)[1])=={'object':'list','data':[]}
    assert request('/admin/api/login',{'password':'test-password'})[0]==200
    cfg=json.loads(request('/admin/api/state')[1])['config'];assert 'admin_password_hash' not in cfg
+   assert not cfg['diagnostics_enabled']
+   cfg['diagnostics_enabled']=True
    assert len(cfg['monitor_schedule'])==4
    bad=json.loads(json.dumps(cfg));bad['monitor_schedule']=[{'start':0,'end':0,'interval_minutes':5},{'start':60,'end':120,'interval_minutes':10}]
    assert request('/admin/api/save',bad)[0]==400
@@ -172,17 +174,20 @@ def main():
    cfg['models'][0]['channels']=[channel('watched','ok')];cfg['models'][0]['channels'][0]['monitor_id']='quality';assert request('/admin/api/save',cfg)[0]==200
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    assert request('/v1/responses',payload,True)[0]==200
+   valid_before=json.loads(request('/admin/api/state')[1])['state']['quality']['quality']['valid_until']
    monitor_error=(403,b'{"error":{"code":"permission_denied","message":"model access disabled"}}')
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    q=json.loads(request('/admin/api/state')[1])['state']['quality']['quality'];error=q['error']
    assert all(x in error for x in ('HTTP 403 Forbidden','上游拒绝访问','code=permission_denied','message=model access disabled')),error
    assert q['verdict']=='unknown'
+   assert q['error_streak']==1 and q['next_at']<=q['checked_at']+60 and q['valid_until']==valid_before,q
    monitor_error=None
    monitor_started.clear();monitor_delay=1
    checks=[];worker=threading.Thread(target=lambda:checks.append(request('/admin/api/verify',{'monitor_id':'quality'})[0]));worker.start()
    assert monitor_started.wait(5)
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==409
    worker.join();assert checks==[200];monitor_delay=0
+   assert json.loads(request('/admin/api/state')[1])['state']['quality']['quality']['error_streak']==0
    candy_answer='20';assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    before=len(seen)
    assert request('/v1/responses',payload,True)[0]==503
@@ -241,16 +246,23 @@ def main():
    assert not key['suspect'] and not key['service_failed'],key
    assert request('/v1/responses',payload,True)[0]==200
 
-   # Queue timeouts never mark a healthy key suspect or consume failure budget.
+   # Queue timeouts start confirmation, not immediate isolation.
    cfg['models'][0]['channels']=[channel('timeout','timeout'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
    for _ in range(2):
     before=sum(path=='/timeout/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)
     assert request('/v1/responses',payload,True)[0]==200
     assert sum(path=='/timeout/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)==before+1
-    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key'];assert not key['suspect'] and not key['service_failed']
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key'];assert key['suspect'] and not key['service_failed']
    request('/admin/api/verify',{'channel_id':'timeout'})
    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key']
-   assert key['confirmation_failures']==0 and key['probe_attempts']==0 and not key['suspect'] and not key['service_failed'] and key['retry_at']==0,key
+   assert key['confirmation_failures']>=1 and key['probe_attempts']==0 and key['suspect'] and not key['service_failed'],key
+
+   # Non-2xx probe bodies must distinguish credentials/quota from service faults.
+   for prefix,flag in [('quota403','request_exhausted'),('auth403','credential_failed'),('weekly429','request_exhausted')]:
+    cfg['models'][0]['channels']=[channel(prefix,prefix)];assert request('/admin/api/save',cfg)[0]==200
+    assert request('/admin/api/verify',{'channel_id':prefix})[0]==200
+    key=json.loads(request('/admin/api/state')[1])['state']['keys'][prefix+'-key']
+    assert key[flag] and not key['service_failed'],key
 
    for prefix,flag in [('jsonauth','credential_failed'),('unknown','suspect')]:
     cfg['models'][0]['channels']=[channel(prefix,prefix),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
@@ -267,8 +279,8 @@ def main():
    before=len(seen);assert request('/v1/responses',payload,True)[0]==503;assert len(seen)==before+10
    for name,expected in [('large',200),('alias',200),('unknownterminal',200),('interrupted',200),('together',200),('split',200),('silent',200),('huge',200),('input',400),('validation',422),('okextra',200)]:
     cfg['models'][0]['channels']=[channel('review-'+name,'review/'+name),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
-    before=len(seen);status,body=request('/v1/responses',payload,True)
-    assert status==expected,(name,status,body[:200]);assert len(seen)==before+1,(name,'request replayed')
+    before=sum(d.get('input')==payload['input'] for _,_,d in seen);status,body=request('/v1/responses',payload,True)
+    assert status==expected,(name,status,body[:200]);assert sum(d.get('input')==payload['input'] for _,_,d in seen)==before+1,(name,'request replayed')
     state=json.loads(request('/admin/api/state')[1])['state'];key=state['keys']['review-'+name+'-key']
     assert key['suspect']==(name in ('together','split','interrupted')),(name,key)
     if name=='interrupted':
@@ -305,7 +317,7 @@ def main():
    cfg['models'][0]['channels']=[channel('recover','ok')];assert request('/admin/api/save',cfg)[0]==200
    proc.terminate();proc.wait(timeout=10)
    statepath=pathlib.Path(temp,'state.json');saved=json.loads(statepath.read_text());now=int(time.time())
-   saved['keys']['recover-key'].update(service_failed=True,cooldown_until=now+600,retry_at=now-1,probe_attempts=4,recovery_successes=0,reason='fixture outage')
+   saved['keys']['recover-key'].update(service_failed=True,cooldown_until=now+600,retry_at=now-1,probe_attempts=4,recovery_successes=1,last_recovery_success=now-60,reason='fixture outage')
    statepath.write_text(json.dumps(saved))
    probe_throttled=True
    configpath=pathlib.Path(temp,'config.json');disk=json.loads(configpath.read_text());disk['webhook']='http://127.0.0.1:1/unreachable';configpath.write_text(json.dumps(disk))
@@ -319,10 +331,34 @@ def main():
     key=json.loads(request('/admin/api/state')[1])['state']['keys']['recover-key']
     if key['retry_at']>now:break
     time.sleep(.1)
-   assert key['probe_attempts']==4 and key['retry_at']>now and key['service_failed'],key
+   assert key['probe_attempts']==4 and key['retry_at']>now and key['service_failed'] and key['recovery_successes']==0,key
    probe_throttled=False
    assert request('/admin/api/verify',{'channel_id':'recover','reset':True})[0]==200
    unlocked=json.loads(request('/admin/api/state')[1])['state']['keys']['recover-key'];assert unlocked['cooldown_until']==0 and not unlocked['service_failed']
+   assert request('/v1/responses',payload,True)[0]==200
+   diagnostics=json.loads(request('/admin/api/state')[1])['state']['diagnostics']
+   assert {'service_probe','service_state','quality_check','no_available_channel'} <= {d['kind'] for d in diagnostics}
+   assert all(secret not in json.dumps(diagnostics) for secret in ('upstream-secret','monitor-key','company-secret','test-password'))
+
+   # Legacy exhausted state resumes automatically, confirms twice, then routes.
+   proc.terminate();proc.wait(timeout=10)
+   saved=json.loads(statepath.read_text());now=int(time.time())
+   saved['keys']['recover-key'].update(service_failed=True,probe_exhausted=True,retry_at=0,probe_attempts=12,recovery_successes=0,balance_checked=now,reason='legacy exhausted')
+   statepath.write_text(json.dumps(saved))
+   proc=subprocess.Popen([str(ROOT/'target/debug/forest-router')],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   for _ in range(100):
+    try:request('/');break
+    except OSError:time.sleep(.05)
+   assert request('/admin/api/login',{'password':'test-password'})[0]==200
+   deadline=time.time()+85;observed_first=False
+   while time.time()<deadline:
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['recover-key']
+    if key['service_failed'] and key['recovery_successes']==1:
+     observed_first=True
+     assert not key['probe_exhausted'] and key['retry_at']>0,key
+    if not key['service_failed']:break
+    time.sleep(.25)
+   assert observed_first and not key['service_failed'],key
    assert request('/v1/responses',payload,True)[0]==200
 
    cfg=json.loads(request('/admin/api/state')[1])['config'];cfg['new_password']='changed-password';assert request('/admin/api/save',cfg)[0]==200
