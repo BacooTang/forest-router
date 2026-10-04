@@ -380,6 +380,52 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
     }
     StatusCode::NOT_FOUND.into_response()
 }
+/// Each effort is an independent synchronous request, so the page can show results as they finish.
+pub async fn knowledge(
+    State(app): State<Arc<App>>,
+    h: HeaderMap,
+    Json(v): Json<Value>,
+) -> Response {
+    if !authorized(&app, &h).await || h.get("x-forest-admin").is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let effort = v["effort"].as_str().unwrap_or("");
+    if !crate::knowledge::EFFORTS.contains(&effort) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "思考强度必须为 medium、high 或 xhigh",
+        )
+            .into_response();
+    }
+    let cfg = app.config.read().await.clone();
+    if v["revision"].as_str() != Some(cfg.digest().as_str()) {
+        return (StatusCode::CONFLICT, "配置已变化，请刷新后重新检测").into_response();
+    }
+    let Some(m) = cfg
+        .monitors
+        .iter()
+        .find(|m| Some(m.id.as_str()) == v["monitor_id"].as_str())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(_guard) = app.begin(format!("knowledge:{}:{effort}", m.id)) else {
+        return (StatusCode::CONFLICT, "该思考强度正在检测，请等待结果").into_response();
+    };
+    let Ok(_permit) = app.knowledge_checks.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "已有三档知识库检测正在执行，请等待完成",
+        )
+            .into_response();
+    };
+    let result = crate::knowledge::check(&app, m, cfg.use_system_proxy, effort).await;
+    let current = app.config.read().await;
+    if !Arc::ptr_eq(&current, &cfg) {
+        return (StatusCode::CONFLICT, "检测期间配置已变化，请重新检测").into_response();
+    }
+    Json(result).into_response()
+}
+
 pub async fn detect(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Value>) -> Response {
     if !authorized(&app, &h).await || h.get("x-forest-admin").is_none() {
         return StatusCode::UNAUTHORIZED.into_response();

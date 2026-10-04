@@ -171,6 +171,17 @@ def main():
    cfg['models'][0]['channels']=[channel('early','early'),channel('good','ok')];assert request('/admin/api/save',cfg)[0]==200
    status,body=request('/v1/responses',payload,True);assert status==200 and b'response.failed' not in body
    cfg['webhook']=f'http://127.0.0.1:{up}/hook';cfg['monitors']=[{'id':'quality','name':'quality','base_url':f'http://127.0.0.1:{up}/v1','key':'monitor-key','model':'test'}]
+   assert request('/admin/api/save',cfg)[0]==200
+   assert json.loads(request('/admin/api/state')[1])['config']['monitors'][0]['reasoning_effort']=='high'
+   bad=json.loads(json.dumps(cfg));bad['monitors'][0]['reasoning_effort']='invalid'
+   assert request('/admin/api/save',bad)[0]==400
+   for effort in ('high','low','medium','xhigh','high'):
+    cfg['monitors'][0]['reasoning_effort']=effort
+    assert request('/admin/api/save',cfg)[0]==200
+    assert 'quality' not in json.loads(request('/admin/api/state')[1])['state']['quality'], 'old effort result was retained'
+    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+    assert seen[-1][0]=='/v1/chat/completions' and seen[-1][2]['reasoning_effort']==effort
+    assert json.loads(request('/admin/api/state')[1])['state']['quality']['quality']['verdict']=='healthy'
    cfg['models'][0]['channels']=[channel('watched','ok')];cfg['models'][0]['channels'][0]['monitor_id']='quality';assert request('/admin/api/save',cfg)[0]==200
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    assert request('/v1/responses',payload,True)[0]==200

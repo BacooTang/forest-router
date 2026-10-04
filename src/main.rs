@@ -4,6 +4,7 @@ mod balance;
 mod config;
 mod errors;
 mod health;
+mod knowledge;
 mod monitor;
 mod notifications;
 mod proxy;
@@ -132,6 +133,7 @@ async fn main() {
         system_client: std::sync::RwLock::new(upstream::client(true).expect("system proxy client")),
         admin_requests: Arc::new(Semaphore::new(8)),
         checks: Arc::new(Semaphore::new(4)),
+        knowledge_checks: Arc::new(Semaphore::new(3)),
         login_slots: Arc::new(Semaphore::new(1)),
         login_gate: Mutex::new((0, 0)),
         sessions: Mutex::new(std::collections::HashMap::new()),
@@ -158,6 +160,7 @@ async fn main() {
         .route("/admin/api/save", post(admin::save))
         .route("/admin/api/verify", post(admin::verify))
         .route("/admin/api/detect", post(admin::detect))
+        .route("/admin/api/knowledge", post(admin::knowledge))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),

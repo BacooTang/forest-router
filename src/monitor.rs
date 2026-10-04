@@ -53,7 +53,7 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
     let started = std::time::Instant::now();
     let outcome=async {
         let response=upstream::control_request(&app.upstream_client(cfg.use_system_proxy), reqwest::Method::POST, &format!("{root}/chat/completions")).bearer_auth(&m.key)
-            .json(&json!({"model":m.model,"messages":[{"role":"user","content":CANDY}],"stream":false,"thinking":{"type":"enabled"},"reasoning_effort":"low"}))
+            .json(&json!({"model":m.model,"messages":[{"role":"user","content":CANDY}],"stream":false,"thinking":{"type":"enabled"},"reasoning_effort":m.reasoning_effort}))
             .timeout(Duration::from_secs(180)).send().await.map_err(|_|"检测请求失败".to_owned())?;
         let v=upstream::monitor_json(response).await?;
         let text=v["choices"][0]["message"]["content"].as_str().filter(|s|!s.is_empty()).ok_or("检测响应缺少答案")?;

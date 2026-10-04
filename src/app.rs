@@ -15,6 +15,7 @@ pub struct App {
     pub system_client: std::sync::RwLock<reqwest::Client>,
     pub admin_requests: Arc<Semaphore>,
     pub checks: Arc<Semaphore>,
+    pub knowledge_checks: Arc<Semaphore>,
     pub login_slots: Arc<Semaphore>,
     pub login_gate: Mutex<(u32, i64)>,
     pub sessions: Mutex<HashMap<String, i64>>,

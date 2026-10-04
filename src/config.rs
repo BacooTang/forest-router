@@ -141,6 +141,11 @@ pub struct Monitor {
     pub base_url: String,
     pub key: String,
     pub model: String,
+    #[serde(default = "default_monitor_effort")]
+    pub reasoning_effort: String,
+}
+fn default_monitor_effort() -> String {
+    "high".into()
 }
 fn enabled_by_default() -> bool {
     true
@@ -202,6 +207,9 @@ impl Config {
             return Err("监听地址必须为IP:端口".into());
         }
         for m in &self.monitors {
+            if !["low", "medium", "high", "xhigh"].contains(&m.reasoning_effort.as_str()) {
+                return Err("监控思考强度必须为 low、medium、high 或 xhigh".into());
+            }
             if m.id.len() > 128
                 || m.name.len() > 256
                 || m.key.is_empty()
@@ -334,6 +342,54 @@ impl Channel {
 }
 impl Monitor {
     pub fn identity(&self) -> String {
-        fingerprint((&self.base_url, &self.model, &self.key))
+        fingerprint((
+            &self.base_url,
+            &self.model,
+            &self.key,
+            &self.reasoning_effort,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_monitors_default_to_high_and_reject_invalid_efforts() {
+        let mut cfg: Config = serde_json::from_value(json!({
+            "listen":"127.0.0.1:8119", "api_key":"fixture", "admin_password_hash":"",
+            "monitors":[{"id":"monitor", "name":"fixture", "base_url":"http://localhost/v1",
+                "key":"fixture-key", "model":"fixture-model"}]
+        }))
+        .unwrap();
+        assert_eq!(cfg.monitors[0].reasoning_effort, "high");
+        assert!(cfg.validate().is_ok());
+        for effort in ["low", "medium", "high", "xhigh"] {
+            cfg.monitors[0].reasoning_effort = effort.into();
+            assert!(cfg.validate().is_ok());
+        }
+        cfg.monitors[0].reasoning_effort = "invalid".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn effort_change_invalidates_quality_but_display_name_does_not() {
+        let mut cfg: Config = serde_json::from_value(json!({
+            "listen":"127.0.0.1:8119", "api_key":"fixture", "admin_password_hash":"",
+            "monitors":[{"id":"monitor", "name":"fixture", "base_url":"http://localhost/v1",
+                "key":"fixture-key", "model":"fixture-model", "reasoning_effort":"low"}]
+        }))
+        .unwrap();
+        let mut state = crate::state::State::default();
+        state.reconcile(&cfg);
+        state.quality.entry("monitor".into()).or_default().verdict = "healthy".into();
+        cfg.monitors[0].name = "renamed".into();
+        state.reconcile(&cfg);
+        assert_eq!(state.quality["monitor"].verdict, "healthy");
+        cfg.monitors[0].reasoning_effort = "high".into();
+        state.reconcile(&cfg);
+        assert!(!state.quality.contains_key("monitor"));
     }
 }
