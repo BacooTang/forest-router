@@ -51,15 +51,44 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         root.push_str("/v1");
     }
     let started = std::time::Instant::now();
-    let outcome=async {
+    let candy = async {
         let response=upstream::control_request(&app.upstream_client(cfg.use_system_proxy), reqwest::Method::POST, &format!("{root}/chat/completions")).bearer_auth(&m.key)
             .json(&json!({"model":m.model,"messages":[{"role":"user","content":CANDY}],"stream":false,"thinking":{"type":"enabled"},"reasoning_effort":m.reasoning_effort}))
             .timeout(Duration::from_secs(180)).send().await.map_err(|_|"检测请求失败".to_owned())?;
-        let v=upstream::monitor_json(response).await?;
-        let text=v["choices"][0]["message"]["content"].as_str().filter(|s|!s.is_empty()).ok_or("检测响应缺少答案")?;
-        if v["choices"][0]["finish_reason"]=="length" {return Err("检测答案被截断".into());}
-        Ok::<_,String>(judge(text))
-    }.await;
+        let v = upstream::monitor_json(response).await?;
+        let text = v["choices"][0]["message"]["content"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("检测响应缺少答案")?;
+        if v["choices"][0]["finish_reason"] == "length" {
+            return Err("检测答案被截断".into());
+        }
+        Ok::<_, String>(judge(text))
+    };
+    let knowledge = async {
+        if !m.knowledge_check {
+            return None;
+        }
+        let Some(_guard) = app.begin(format!("knowledge:{}:{}", m.id, m.reasoning_effort)) else {
+            return Some(crate::knowledge::assess(
+                String::new(),
+                &m.reasoning_effort,
+                "该思考强度正在检测，请等待结果".into(),
+                0,
+            ));
+        };
+        let Ok(_permit) = app.knowledge_checks.clone().acquire_owned().await else {
+            return Some(crate::knowledge::assess(
+                String::new(),
+                &m.reasoning_effort,
+                "检测未能启动".into(),
+                0,
+            ));
+        };
+        Some(crate::knowledge::check(app, m, cfg.use_system_proxy, &m.reasoning_effort).await)
+    };
+    let (candy, knowledge) = tokio::join!(candy, knowledge);
+    let (outcome, detail) = combined_outcome(candy, knowledge);
     let current = app.config.read().await;
     if !Arc::ptr_eq(&current, cfg) {
         return false;
@@ -91,7 +120,7 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         let delay = (60_i64 * (1_i64 << q.error_streak.saturating_sub(1).min(3))).min(300);
         q.next_at = q.next_at.min(now + delay);
     }
-    q.error = outcome.err().unwrap_or_default();
+    q.error = detail;
     let event_error = q.error.clone();
     while q.history.len() >= 72 {
         q.history.pop_front();
@@ -141,6 +170,37 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
         ));
     }
     true
+}
+// A definite failure takes precedence over an error in the other check.
+fn combined_outcome(
+    candy: Result<bool, String>,
+    knowledge: Option<crate::knowledge::Result>,
+) -> (Result<bool, String>, String) {
+    if knowledge.is_none() {
+        let detail = candy.as_ref().err().cloned().unwrap_or_default();
+        return (candy, detail);
+    }
+    let knowledge = knowledge.unwrap();
+    let mut details = Vec::new();
+    match &candy {
+        Ok(false) => details.push("糖果题未通过".to_owned()),
+        Err(error) => details.push(format!("糖果题：{error}")),
+        _ => {}
+    }
+    match knowledge.verdict {
+        "degraded" => details.push(format!("知识库未通过：{}/25 题已回答", knowledge.answered)),
+        "unknown" => details.push(format!("知识库：{}", knowledge.error)),
+        _ => {}
+    }
+    let detail = details.join("；");
+    let outcome = if candy == Ok(false) || knowledge.verdict == "degraded" {
+        Ok(false)
+    } else if candy.is_err() || knowledge.verdict == "unknown" {
+        Err(detail.clone())
+    } else {
+        Ok(true)
+    };
+    (outcome, detail)
 }
 // One batch produces one summary, including manual runs. Never publish stale config results.
 pub async fn batch(app: &Arc<App>, cfg: &Arc<Config>, monitors: Vec<Monitor>) -> Option<usize> {
@@ -228,7 +288,7 @@ fn summary_cards(
             .format("%m-%d %H:%M")
             .to_string();
         elements.push(json!({"tag":"hr"}));
-        elements.push(json!({"tag":"note","elements":[{"tag":"plain_text","content":format!("{time} · 共 {} 个监控 · 本轮检测 {} 个 · 糖果判据\n详细结果请到降智监控页面查看", cfg.monitors.len(), done.len())}]}));
+        elements.push(json!({"tag":"note","elements":[{"tag":"plain_text","content":format!("{time} · 共 {} 个监控 · 本轮检测 {} 个 · 按监控配置判定\n详细结果请到降智监控页面查看", cfg.monitors.len(), done.len())}]}));
         cards.push(json!({"config":{"wide_screen_mode":true},"header":{"template":color,"title":{"tag":"plain_text","content":format!("{title} · {}/{}", page+1, rows.len().div_ceil(20))}},"elements":elements}));
     }
     cards
@@ -260,6 +320,35 @@ mod tests {
             "orange"
         );
     }
+    #[test]
+    fn combined_checks_require_both_passes_and_failure_beats_errors() {
+        let complete = (1..=25)
+            .map(|i| format!("Q{i:02}｜回答"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for candy in [Ok(true), Ok(false), Err("请求异常".to_owned())] {
+            for (text, error, verdict) in [
+                (complete.clone(), String::new(), "healthy"),
+                (String::new(), String::new(), "degraded"),
+                (String::new(), "请求异常".to_owned(), "unknown"),
+            ] {
+                let knowledge = crate::knowledge::assess(text, "low", error, 0);
+                assert_eq!(knowledge.verdict, verdict);
+                let expected = if candy == Ok(false) || verdict == "degraded" {
+                    Some(false)
+                } else if candy.is_err() || verdict == "unknown" {
+                    None
+                } else {
+                    Some(true)
+                };
+                let (outcome, detail) = combined_outcome(candy.clone(), Some(knowledge));
+                assert_eq!(outcome.ok(), expected);
+                assert_eq!(detail.is_empty(), expected == Some(true));
+            }
+            assert_eq!(combined_outcome(candy.clone(), None).0, candy);
+        }
+    }
+
     #[test]
     fn answer_boundaries() {
         for t in ["21", "答案为21。", "x21x"] {

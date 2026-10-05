@@ -96,13 +96,8 @@ pub fn spawn(app: Arc<App>) {
                 cfg.monitors
                     .iter()
                     .filter(|m| {
-                        cfg.models.iter().any(|model| {
-                            model.channels.iter().any(|c| {
-                                c.enabled
-                                    && c.keys.iter().any(|k| k.enabled)
-                                    && c.monitor_id.as_ref() == Some(&m.id)
-                            })
-                        }) && state.quality.get(&m.id).is_none_or(|q| q.next_at <= now)
+                        m.automatically_scheduled(&cfg)
+                            && state.quality.get(&m.id).is_none_or(|q| q.next_at <= now)
                     })
                     .cloned()
                     .collect::<Vec<_>>()

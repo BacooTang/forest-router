@@ -26,6 +26,8 @@ class Upstream(http.server.BaseHTTPRequestHandler):
     entered = threading.Event()
     release = None
     mode = 'mixed'
+    candy_mode = 'healthy'
+    paired_seen = []
 
     def log_message(self, *args):
         pass
@@ -35,14 +37,18 @@ class Upstream(http.server.BaseHTTPRequestHandler):
         assert self.path == '/v1/chat/completions'
         assert self.headers['Authorization'] == 'Bearer fixture-key'
         assert body['model'] == 'fixture-model'
-        assert body['messages'] == [{'role':'user','content':PROMPT}]
+        is_knowledge = body['messages'] == [{'role':'user','content':PROMPT}]
+        if not is_knowledge:
+            assert '糖果' in body['messages'][0]['content']
         assert body['stream'] is False and body['thinking'] == {'type':'enabled'}
         assert 'tools' not in body
         effort = body['reasoning_effort']
         with self.lock:
             type(self).active += 1
             type(self).peak = max(self.peak, self.active)
-            self.seen.append(effort)
+            if is_knowledge:
+                self.seen.append(effort)
+            self.paired_seen.append(('knowledge' if is_knowledge else 'candy',effort))
         try:
             self.entered.set()
             if self.barrier:
@@ -65,6 +71,9 @@ class Upstream(http.server.BaseHTTPRequestHandler):
                 status = 429
             elif self.mode == 'large':
                 text = 'x' * 262145
+            if not is_knowledge:
+                text = '21' if self.candy_mode == 'healthy' else '20'
+                status, finish = (503 if self.candy_mode == 'http' else 200), 'stop'
             value = {'choices':[{'message':{'content':text},'finish_reason':finish}]}
             raw = json.dumps(value).encode()
             self.send_response(status)
@@ -160,6 +169,95 @@ def main():
             assert before['traffic'] == after['traffic'], 'knowledge test counted as business traffic'
             assert before['client_usage'] == after['client_usage'], 'knowledge test counted employee usage'
             assert not any(e['kind']=='quality' for e in after['state']['events'])
+            # Both options default off, including persisted legacy configurations.
+            cfg = after['config']
+            assert cfg['monitors'][0]['force_check'] is False
+            assert cfg['monitors'][0]['knowledge_check'] is False
+            cfg['monitors'][0]['model'] = 'fixture-model'
+            save(cfg)
+            initial = len(Upstream.paired_seen)
+            time.sleep(5.2)
+            assert len(Upstream.paired_seen) == initial, 'unbound monitor ran without force_check'
+            assert not state()['state']['quality']
+
+            # An unbound forced monitor joins the scheduler and runs both checks concurrently.
+            cfg['monitors'][0].update(force_check=True,knowledge_check=True,reasoning_effort='high')
+            Upstream.barrier = threading.Barrier(2)
+            save(cfg)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                quality = state()['state']['quality'].get('fixture')
+                if quality and quality['checked_at']:
+                    break
+                time.sleep(.05)
+            else:
+                raise AssertionError('forced unbound monitor never ran')
+            Upstream.barrier = None
+            assert quality['verdict'] == 'healthy', quality
+            assert sorted(Upstream.paired_seen[initial:]) == [('candy','high'),('knowledge','high')]
+            assert quality['next_at'] > quality['checked_at']
+            cfg['monitors'][0]['force_check'] = False
+            save(cfg)
+            assert state()['state']['quality']['fixture'] == quality, 'force toggle cleared quality'
+
+            def verify():
+                code, raw, _ = request('/admin/api/verify',{'monitor_id':'fixture'})
+                assert code == 200, raw
+                return state()['state']['quality']['fixture']
+            for effort in ['low','medium','high','xhigh']:
+                cfg['monitors'][0]['reasoning_effort'] = effort
+                save(cfg)
+                initial = len(Upstream.paired_seen)
+                Upstream.barrier = threading.Barrier(2)
+                assert verify()['verdict'] == 'healthy'
+                Upstream.barrier = None
+                assert sorted(Upstream.paired_seen[initial:]) == [('candy',effort),('knowledge',effort)]
+            for candy_mode, knowledge_mode, verdict in [
+                ('healthy','missing','degraded'), ('degraded','complete','degraded'),
+                ('degraded','missing','degraded'), ('degraded','http','degraded'),
+                ('http','missing','degraded'), ('healthy','http','unknown'),
+                ('http','complete','unknown'), ('healthy','complete','healthy'),
+            ]:
+                Upstream.candy_mode, Upstream.mode = candy_mode, knowledge_mode
+                result = verify()
+                assert result['verdict'] == verdict, (candy_mode,knowledge_mode,result)
+                if knowledge_mode == 'missing':
+                    assert '知识库未通过：24/25' in result['error']
+                if verdict == 'unknown':
+                    assert result['error_streak'] and result['next_at'] <= result['checked_at'] + 120
+                if verdict == 'healthy':
+                    assert result['error_streak'] == 0 and not result['error']
+
+            # Reuse the knowledge guard, reject duplicate monitoring, discard stale paired results.
+            Upstream.entered.clear()
+            Upstream.release = threading.Event()
+            payload = {'monitor_id':'fixture','effort':'xhigh','revision':cfg['_revision']}
+            old_quality = state()['state']['quality']['fixture']
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(request,'/admin/api/verify',{'monitor_id':'fixture'})
+                assert Upstream.entered.wait(5)
+                deadline = time.monotonic() + 5
+                while Upstream.active < 2 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                assert Upstream.active == 2
+                assert request('/admin/api/verify',{'monitor_id':'fixture'})[0] == 409
+                assert request('/admin/api/knowledge',payload)[0] == 409
+                cfg['monitors'][0]['name'] = 'renamed during check'
+                save(cfg)
+                Upstream.release.set()
+                assert future.result()[0] == 409
+            Upstream.release = None
+            assert state()['state']['quality']['fixture'] == old_quality
+            cfg['monitors'][0]['knowledge_check'] = False
+            save(cfg)
+            assert not state()['state']['quality'], 'knowledge toggle kept old paired verdict'
+            initial = len(Upstream.paired_seen)
+            assert verify()['verdict'] == 'healthy'
+            assert Upstream.paired_seen[initial:] == [('candy','xhigh')]
+            final = state()
+            assert before['traffic'] == final['traffic'] and before['client_usage'] == final['client_usage']
+            assert PROMPT not in json.dumps(final,ensure_ascii=False), 'raw knowledge prompt persisted'
+            print('PASS paired monitoring: legacy defaults off, forced unbound scheduling, concurrent checks at all four efforts, either failure blocks quality, errors stay unknown, option invalidation, deduplication, config protection; no business usage')
             print('PASS knowledge: three efforts overlap; exact prompt, coverage-only judgement, unknown/blank/missing/placeholders, independent questions, truncation/HTTP/size errors, auth, deduplication, config protection; no route or usage mutation')
         finally:
             Upstream.barrier = None

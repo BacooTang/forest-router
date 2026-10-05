@@ -32,13 +32,13 @@ pub struct Group {
 #[derive(Serialize)]
 pub struct Result {
     effort: String,
-    verdict: &'static str,
-    answered: usize,
+    pub verdict: &'static str,
+    pub answered: usize,
     total: usize,
     questions: Vec<Question>,
     groups: Vec<Group>,
     text: String,
-    error: String,
+    pub error: String,
     elapsed_ms: u64,
 }
 

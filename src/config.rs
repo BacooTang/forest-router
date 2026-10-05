@@ -143,6 +143,10 @@ pub struct Monitor {
     pub model: String,
     #[serde(default = "default_monitor_effort")]
     pub reasoning_effort: String,
+    #[serde(default)]
+    pub force_check: bool,
+    #[serde(default)]
+    pub knowledge_check: bool,
 }
 fn default_monitor_effort() -> String {
     "high".into()
@@ -341,7 +345,27 @@ impl Channel {
     }
 }
 impl Monitor {
+    pub fn automatically_scheduled(&self, cfg: &Config) -> bool {
+        self.force_check
+            || cfg.models.iter().any(|model| {
+                model.channels.iter().any(|c| {
+                    c.enabled
+                        && c.keys.iter().any(|k| k.enabled)
+                        && c.monitor_id.as_ref() == Some(&self.id)
+                })
+            })
+    }
     pub fn identity(&self) -> String {
+        if self.knowledge_check {
+            return fingerprint((
+                &self.base_url,
+                &self.model,
+                &self.key,
+                &self.reasoning_effort,
+                true,
+            ));
+        }
+        // Preserve existing candy-only quality identities when loading old configs.
         fingerprint((
             &self.base_url,
             &self.model,
@@ -365,6 +389,8 @@ mod monitor_tests {
         }))
         .unwrap();
         assert_eq!(cfg.monitors[0].reasoning_effort, "high");
+        assert!(!cfg.monitors[0].force_check);
+        assert!(!cfg.monitors[0].knowledge_check);
         assert!(cfg.validate().is_ok());
         for effort in ["low", "medium", "high", "xhigh"] {
             cfg.monitors[0].reasoning_effort = effort.into();
@@ -372,6 +398,50 @@ mod monitor_tests {
         }
         cfg.monitors[0].reasoning_effort = "invalid".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn force_check_bypasses_channel_binding_without_changing_quality_identity() {
+        let mut cfg: Config = serde_json::from_value(json!({
+            "listen":"127.0.0.1:8119", "api_key":"fixture", "admin_password_hash":"",
+            "monitors":[{"id":"monitor", "name":"fixture", "base_url":"http://localhost/v1",
+                "key":"fixture-key", "model":"fixture-model"}],
+            "models":[{"id":"public", "channels":[{"id":"channel", "name":"fixture",
+                "base_url":"http://localhost/v1", "upstream_model":"fixture-model",
+                "adapter":"auto", "enabled":true, "monitor_id":"monitor",
+                "keys":[{"id":"key", "label":"fixture", "secret":"fixture-key", "enabled":true}]}]}]
+        }))
+        .unwrap();
+        let identity = cfg.monitors[0].identity();
+        assert!(cfg.monitors[0].automatically_scheduled(&cfg));
+        cfg.models[0].channels[0].keys[0].enabled = false;
+        assert!(!cfg.monitors[0].automatically_scheduled(&cfg));
+        cfg.models[0].channels[0].keys[0].enabled = true;
+        cfg.models[0].channels[0].enabled = false;
+        assert!(!cfg.monitors[0].automatically_scheduled(&cfg));
+        cfg.models.clear();
+        assert!(!cfg.monitors[0].automatically_scheduled(&cfg));
+        cfg.monitors[0].force_check = true;
+        assert!(cfg.monitors[0].automatically_scheduled(&cfg));
+        assert_eq!(cfg.monitors[0].identity(), identity);
+    }
+
+    #[test]
+    fn knowledge_option_invalidates_quality_in_both_directions() {
+        let mut cfg: Config = serde_json::from_value(json!({
+            "listen":"127.0.0.1:8119", "api_key":"fixture", "admin_password_hash":"",
+            "monitors":[{"id":"monitor", "name":"fixture", "base_url":"http://localhost/v1",
+                "key":"fixture-key", "model":"fixture-model"}]
+        }))
+        .unwrap();
+        let mut state = crate::state::State::default();
+        state.reconcile(&cfg);
+        for enabled in [true, false] {
+            state.quality.entry("monitor".into()).or_default().verdict = "healthy".into();
+            cfg.monitors[0].knowledge_check = enabled;
+            state.reconcile(&cfg);
+            assert!(!state.quality.contains_key("monitor"));
+        }
     }
 
     #[test]

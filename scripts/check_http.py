@@ -5,6 +5,7 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 seen=[]
 hooks=[]
 candy_answer="21"
+knowledge_answer="\n".join(f"Q{i:02}｜有效回答" for i in range(1,26))
 monitor_error=None
 monitor_delay=0
 transient_fail=False
@@ -22,7 +23,8 @@ class Upstream(http.server.BaseHTTPRequestHandler):
    monitor_started.set();time.sleep(monitor_delay)
    if monitor_error:
     status,raw=monitor_error;self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw);return
-   out=json.dumps({'choices':[{'message':{'content':candy_answer},'finish_reason':'stop'}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
+   answer=knowledge_answer if 'Q25｜' in d['messages'][0]['content'] else candy_answer
+   out=json.dumps({'choices':[{'message':{'content':answer},'finish_reason':'stop'}]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out);return
   if self.path.startswith('/transient/') and transient_fail and d.get('input')!='Reply OK.':
    self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
   if self.path.startswith('/early/'):
@@ -72,7 +74,7 @@ class Upstream(http.server.BaseHTTPRequestHandler):
 def freeport():
  s=socket.socket();s.bind(('127.0.0.1',0));p=s.getsockname()[1];s.close();return p
 def main():
- global candy_answer,monitor_delay,probe_throttled,transient_fail,monitor_error
+ global candy_answer,knowledge_answer,monitor_delay,probe_throttled,transient_fail,monitor_error
  server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream);threading.Thread(target=server.serve_forever,daemon=True).start();up=server.server_port
  with tempfile.TemporaryDirectory(prefix='forest-check-') as temp:
   port=freeport();base=f'http://127.0.0.1:{port}';env=dict(os.environ,FOREST_ROUTER_HOME=temp,FOREST_LISTEN=f'127.0.0.1:{port}',FOREST_ADMIN_PASSWORD='test-password',FOREST_API_KEY='company-secret',HTTP_PROXY=f'http://127.0.0.1:{up}',http_proxy=f'http://127.0.0.1:{up}',HTTPS_PROXY=f'http://127.0.0.1:{up}',https_proxy=f'http://127.0.0.1:{up}',NO_PROXY='',no_proxy='')
@@ -185,6 +187,22 @@ def main():
    cfg['models'][0]['channels']=[channel('watched','ok')];cfg['models'][0]['channels'][0]['monitor_id']='quality';assert request('/admin/api/save',cfg)[0]==200
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    assert request('/v1/responses',payload,True)[0]==200
+   cfg['webhook']=''
+   cfg['monitors'][0]['knowledge_check']=True;assert request('/admin/api/save',cfg)[0]==200
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   assert request('/v1/responses',payload,True)[0]==200
+   knowledge_answer=knowledge_answer.replace('Q25｜有效回答','Q25｜不清楚')
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   q=json.loads(request('/admin/api/state')[1])['state']['quality']['quality']
+   assert q['verdict']=='degraded' and '知识库未通过：24/25' in q['error']
+   before=len(seen);assert request('/v1/responses',payload,True)[0]==503
+   assert len(seen)==before, 'knowledge failure did not exclude the bound channel'
+   knowledge_answer=knowledge_answer.replace('Q25｜不清楚','Q25｜有效回答')
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   assert request('/v1/responses',payload,True)[0]==200
+   cfg['webhook']=f'http://127.0.0.1:{up}/hook'
+   cfg['monitors'][0]['knowledge_check']=False;assert request('/admin/api/save',cfg)[0]==200
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    valid_before=json.loads(request('/admin/api/state')[1])['state']['quality']['quality']['valid_until']
    monitor_error=(403,b'{"error":{"code":"permission_denied","message":"model access disabled"}}')
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
@@ -397,6 +415,6 @@ def main():
    assert request('/admin/api/state')[0]==401
    assert request('/admin/api/login',{'password':'changed-password'})[0]==200
 
-   print('PASS: login, configuration, SSE pass-through, header/model substitution, priority failover, failed candidate skip, unknown model, nonportable history, manual check, quota classification, cache cleanup, all unavailable')
+   print('PASS: login, configuration, SSE pass-through, header/model substitution, priority failover, failed candidate skip, unknown model, nonportable history, manual check, paired knowledge failure excludes bound channel and recovery restores routing, quota classification, cache cleanup, all unavailable')
   finally:proc.terminate();proc.wait(timeout=5);server.shutdown()
 if __name__=='__main__':main()
