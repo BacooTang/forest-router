@@ -35,6 +35,21 @@ const fs=require('fs'),os=require('os'),path=require('path'),cp=require('child_p
   await page.locator('[data-effort="medium"] summary').first().click();await page.locator('[data-effort="xhigh"] summary').last().click();if(await page.evaluate(()=>window.knowledgeInjected))throw Error('upstream answer executed as HTML');await page.screenshot({path:path.join(__dirname,'../.runtime/ui-knowledge.png'),fullPage:true});
   await page.setViewportSize({width:375,height:800});if(await page.locator('#dialog').evaluate(d=>d.scrollWidth>d.clientWidth))throw Error('knowledge modal mobile overflow');if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))throw Error('knowledge page mobile overflow');await page.screenshot({path:path.join(__dirname,'../.runtime/ui-knowledge-mobile.png'),fullPage:true});await page.setViewportSize({width:1440,height:1000});
   knowledgeMode='degraded';await page.getByRole('button',{name:'重新检测三档',exact:true}).click();await page.locator('#knowledgeRetry:not(:disabled)').waitFor();await page.getByText('三档均疑似降质：都存在未回答题目',{exact:true}).waitFor();if(knowledgeRequests!==6)throw Error('retry did not run exactly three requests');await page.getByRole('button',{name:'关闭',exact:true}).click();if(await page.locator('.monitor-card').getByText('降智',{exact:true}).count())throw Error('knowledge run changed automatic quality badge');
+  // Pending manual checks survive the page's five-second refresh; errors
+  // restore the button and remain visible instead of looking like no action.
+  let releaseVerify;const verifyGate=new Promise(resolve=>releaseVerify=resolve);
+  await page.route('**/admin/api/verify',async route=>{await verifyGate;await route.fulfill({status:409,contentType:'text/plain',body:'该监控正在执行或配置已变化，请稍后重试'})});
+  await page.locator('[data-action="verify-monitor"]').click();
+  await page.evaluate(async()=>{await refresh();render()});
+  if(!await page.locator('[data-action="verify-monitor"]').isDisabled()||!(await page.locator('[data-action="verify-monitor"]').textContent()).includes('含排队'))throw Error('pending monitor lost on refresh');
+  releaseVerify();await page.locator('[data-action="verify-monitor"]:not(:disabled)').waitFor();
+  await page.getByText('该监控正在执行或配置已变化，请稍后重试',{exact:true}).waitFor();
+  if(await page.locator('[data-action="verify-monitor"]').textContent()!=='重新检测')throw Error('failed monitor button not restored');
+  await page.unroute('**/admin/api/verify');
+  await page.route('**/admin/api/state',async route=>{const response=await route.fetch(),body=await response.json();body.checks={['monitor:'+body.config.monitors[0].id]:{phase:'queued',started_at:Math.floor(Date.now()/1000)-12}};await route.fulfill({response,json:body})});
+  await page.evaluate(()=>refresh(true));
+  if(!await page.locator('[data-action="verify-monitor"]').isDisabled()||!(await page.locator('[data-action="verify-monitor"]').textContent()).includes('等待检查名额'))throw Error('server-side queued task not shown');
+  await page.unroute('**/admin/api/state');await page.evaluate(()=>refresh(true));
   for(const effort of ['low','high']){await page.locator('[data-action="edit-monitor"]').click();await page.locator('#meffort').selectOption(effort);await page.locator('#monitorForm button[type=submit]').click();await page.locator('#dialog').waitFor({state:'hidden'});await page.locator('[data-action="verify-monitor"]').click();await page.locator('.monitor-card').getByText('满血',{exact:true}).waitFor();if(candyEfforts.at(-1)!==effort)throw Error('candy test ignored selected effort');await page.locator('[data-action="edit-monitor"]').click();if(await page.locator('#meffort').inputValue()!==effort)throw Error('monitor effort did not persist');if(effort==='high')await page.screenshot({path:path.join(__dirname,'../.runtime/ui-monitor-effort.png'),fullPage:true});await page.getByRole('button',{name:'取消',exact:true}).click()}
   await page.locator('[data-action="edit-monitor"]').click();await page.locator('#mknowledge').check();await page.locator('#meffort').selectOption('low');await page.setViewportSize({width:375,height:800});if(await page.locator('#dialog').evaluate(d=>d.scrollWidth>d.clientWidth))throw Error('monitor edit mobile overflow');await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:path.join(__dirname,'../.runtime/ui-monitor-options.png'),fullPage:true});await page.locator('#monitorForm button[type=submit]').click();await page.locator('#dialog').waitFor({state:'hidden'});
   const pairedStart=knowledgeRequests;await page.locator('[data-action="verify-monitor"]').click();await page.locator('.monitor-card').getByText('降智',{exact:true}).waitFor();if(knowledgeRequests!==pairedStart+1||knowledgeBodies.at(-1).reasoning_effort!=='low'||candyEfforts.at(-1)!=='low')throw Error('paired monitoring did not use selected effort');await page.locator('.monitor-card').getByText('知识库未通过：24/25 题已回答',{exact:true}).waitFor();
@@ -42,6 +57,21 @@ const fs=require('fs'),os=require('os'),path=require('path'),cp=require('child_p
   await page.locator('#nav button').filter({hasText:'日志'}).click();await page.getByRole('heading',{name:'事件日志'}).waitFor();if(!await page.locator('.log').textContent())throw Error('missing logs');
   await page.locator('#nav button').filter({hasText:'设置'}).click();if(await page.locator('#useSystemProxy').isChecked())throw Error('system proxy must default off');if(await page.locator('#notifyAllMonitors').isChecked())throw Error('summary must default off');await page.locator('#notifyAllMonitors').check();await page.locator('#apiKey').fill('changed-company-key');await page.getByRole('button',{name:'保存设置'}).click();await page.waitForTimeout(300);if(!await page.locator('#notifyAllMonitors').isChecked())throw Error('summary setting not retained');
   await page.locator('#nav button').filter({hasText:'配置中心'}).click();await page.getByRole('button',{name:'编辑',exact:true}).click();if(await page.locator('[data-secret="0"]').inputValue()!=='fixture-key')throw Error('plaintext key not retained');await page.getByRole('button',{name:'取消',exact:true}).click();
+  // A committed save followed by a failed state fetch must not invite a
+  // duplicate save or leave the local configuration revision obsolete.
+  await page.getByRole('button',{name:'编辑模型',exact:true}).click();
+  await page.route('**/admin/api/state',route=>route.fulfill({status:503,body:'fixture state failure'}));
+  await page.locator('#modelForm button[type=submit]').click();await page.locator('#dialog').waitFor({state:'hidden'});
+  await page.getByText('配置已保存，但状态刷新失败；请稍后刷新，不必重复保存',{exact:true}).waitFor();
+  await page.unroute('**/admin/api/state');await page.evaluate(()=>refresh(true));
+  // Keep edits intact if a state response arrives after editing begins.
+  await page.locator('#nav button').filter({hasText:'设置'}).click();
+  let releaseState,startedState;const stateGate=new Promise(r=>releaseState=r),stateStarted=new Promise(r=>startedState=r);
+  await page.route('**/admin/api/state',async route=>{const response=await route.fetch();startedState();await stateGate;await route.fulfill({response})});
+  await page.evaluate(()=>{void refresh(true)});await stateStarted;
+  await page.locator('#apiKey').fill('unsaved-edit');releaseState();await page.waitForTimeout(100);
+  if(await page.locator('#apiKey').inputValue()!=='unsaved-edit')throw Error('late state response overwrote unsaved settings');
+  await page.unroute('**/admin/api/state');await page.locator('#nav button').filter({hasText:'配置中心'}).click();
   await page.setViewportSize({width:750,height:1000});await page.screenshot({path:path.join(__dirname,'../.runtime/ui-narrow.png'),fullPage:true});
   if(errors.length)throw Error(errors.join('\n'));console.log('PASS UI: login, model creation, provider identification, plaintext key persistence, channel save, current-route highlight, logs and settings; knowledge button, parallel efforts, incremental/cached results, placeholders and errors, three degraded efforts, mobile modal, escaped answers; monitor options default off, persist and run paired checks with selected effort, forced schedule display; no JS errors');
  }finally{if(browser)await browser.close();child.kill('SIGTERM');await new Promise(r=>child.on('exit',r));upstream.close();fs.rmSync(dir,{recursive:true,force:true});}

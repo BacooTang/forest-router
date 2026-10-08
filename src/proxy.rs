@@ -711,8 +711,8 @@ async fn record_route(app: &App, cfg: &Arc<config::Config>, model: &str, id: &st
 }
 
 async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, status: u16) {
-    // A single gateway timeout is inconclusive; persistent ones use the same
-    // bounded confirmation window as transport errors.
+    // Gateway/service-unavailable responses may be request-specific. Confirm
+    // persistence with independent probes before excluding a key globally.
     let cfg = app.config.read().await;
     if !Arc::ptr_eq(&cfg, expected) {
         return;
@@ -755,7 +755,8 @@ async fn fail(app: &App, expected: &Arc<config::Config>, id: &str, name: &str, s
             s.revision += 1;
             (changed, "rate_limit")
         }
-        500..=599 if status != 504 => (s.fail_service(now), "service"),
+        502..=504 | 524 => (s.suspect_service(now), "service"),
+        500..=599 => (s.fail_service(now), "service"),
         _ => (s.suspect_service(now), "service"),
     };
     s.reason = if s.suspect {

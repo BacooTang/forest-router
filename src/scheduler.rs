@@ -121,6 +121,10 @@ pub async fn balance_check(
     let Ok(_permit) = app.checks.clone().acquire_owned().await else {
         return false;
     };
+    if !Arc::ptr_eq(&*app.config.read().await, cfg) {
+        return false;
+    }
+    _guard.running();
     let revision = app
         .state
         .lock()

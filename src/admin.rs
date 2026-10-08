@@ -95,6 +95,7 @@ pub async fn state(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
         .remove("admin_password_hash");
     config["_revision"] = json!(cfg.digest());
     let state = app.state.lock().await.clone();
+    let checks = app.inflight.lock().unwrap().clone();
     let usage = app.metrics.lock().unwrap().snapshot().client_usage;
     let routing: std::collections::HashMap<_, _> = cfg
         .models
@@ -111,7 +112,7 @@ pub async fn state(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
         .collect();
     (
         [("cache-control", "no-store")],
-        Json(json!({"config":config,"state":state,"routing":routing,"traffic":app.metrics.lock().unwrap().view(),"client_usage":usage})),
+        Json(json!({"config":config,"state":state,"routing":routing,"traffic":app.metrics.lock().unwrap().view(),"client_usage":usage,"checks":checks})),
     )
         .into_response()
 }
@@ -351,7 +352,7 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
             .as_ref()
             .and_then(|id| cfg.monitors.iter().find(|m| m.id == *id))
         {
-            complete &= crate::monitor::batch(&app, &cfg, vec![m.clone()]).await == Some(1);
+            complete &= crate::monitor::manual(&app, &cfg, m.clone()).await == Some(1);
         }
         {
             let current = app.config.read().await;
@@ -372,8 +373,12 @@ pub async fn verify(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
         .iter()
         .find(|m| Some(m.id.as_str()) == v["monitor_id"].as_str())
     {
-        if crate::monitor::batch(&app, &cfg, vec![m.clone()]).await != Some(1) {
-            return (StatusCode::CONFLICT, "监控正在执行或配置已变化，请稍后重试").into_response();
+        if crate::monitor::manual(&app, &cfg, m.clone()).await != Some(1) {
+            return (
+                StatusCode::CONFLICT,
+                "该监控正在执行或配置已变化，请稍后重试",
+            )
+                .into_response();
         }
         let _ = app.persist().await;
         return Json(json!({"ok":true})).into_response();
@@ -431,7 +436,11 @@ pub async fn detect(State(app): State<Arc<App>>, h: HeaderMap, Json(v): Json<Val
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Ok(_permit) = app.checks.clone().try_acquire_owned() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "后台检查忙碌，请稍后再识别平台与额度",
+        )
+            .into_response();
     };
     let base = v["base_url"].as_str().unwrap_or("");
     let key = v["key"].as_str().unwrap_or("");
@@ -465,8 +474,17 @@ pub async fn limit(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Ok(_permit) = app.admin_requests.clone().try_acquire_owned() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    let slots = if request.method() == axum::http::Method::GET {
+        &app.admin_reads
+    } else {
+        &app.admin_requests
+    };
+    let Ok(_permit) = slots.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "管理操作较多，请等待已有操作完成后重试",
+        )
+            .into_response();
     };
     let mut response = next.run(request).await;
     response.headers_mut().insert(

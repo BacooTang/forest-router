@@ -41,6 +41,10 @@ pub async fn check(app: &Arc<App>, cfg: &Arc<Config>, m: &Monitor) -> bool {
     let Ok(_permit) = app.checks.clone().acquire_owned().await else {
         return false;
     };
+    if !Arc::ptr_eq(&*app.config.read().await, cfg) {
+        return false;
+    }
+    _guard.running();
     let mut root = m.base_url.trim_end_matches('/').to_owned();
     for suffix in ["/chat/completions", "/responses"] {
         if root.ends_with(suffix) {
@@ -204,12 +208,31 @@ fn combined_outcome(
 }
 // One batch produces one summary, including manual runs. Never publish stale config results.
 pub async fn batch(app: &Arc<App>, cfg: &Arc<Config>, monitors: Vec<Monitor>) -> Option<usize> {
+    run_batch(app, cfg, monitors, true).await
+}
+
+/// A single manual check does not compete with an unrelated automatic round.
+/// Per-monitor guards and the shared semaphore still bound duplicate work.
+pub async fn manual(app: &Arc<App>, cfg: &Arc<Config>, monitor: Monitor) -> Option<usize> {
+    run_batch(app, cfg, vec![monitor], false).await
+}
+
+async fn run_batch(
+    app: &Arc<App>,
+    cfg: &Arc<Config>,
+    monitors: Vec<Monitor>,
+    exclusive_round: bool,
+) -> Option<usize> {
     use futures_util::{StreamExt, stream};
     if monitors.is_empty() {
         return Some(0);
     }
-    let _guard = app.begin("monitor-round".into())?;
-    let done = stream::iter(monitors)
+    let _guard = if exclusive_round {
+        Some(app.begin("monitor-round".into())?)
+    } else {
+        None
+    };
+    let checks = stream::iter(monitors)
         .map(|m| async move {
             if check(app, cfg, &m).await {
                 Some(m.id)
@@ -219,8 +242,30 @@ pub async fn batch(app: &Arc<App>, cfg: &Arc<Config>, monitors: Vec<Monitor>) ->
         })
         .buffer_unordered(2)
         .filter_map(|id| async move { id })
-        .collect::<Vec<_>>()
-        .await;
+        .collect::<Vec<_>>();
+    // A saved configuration invalidates this round. Drop its futures promptly
+    // to release check permits/guards instead of waiting up to 600s for stale
+    // knowledge requests and then running the rest of an obsolete queue.
+    let cancelled = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if !Arc::ptr_eq(&*app.config.read().await, cfg) {
+                break;
+            }
+        }
+    };
+    let done = tokio::select! {
+        done = checks => done,
+        () = cancelled => {
+            app.state.lock().await.event(
+                "quality",
+                "配置已变化，取消旧轮智商检测并释放队列；自动调度将按新配置重新检查".into(),
+            );
+            let _ = app.persist().await;
+            return None;
+        }
+    };
     let current = app.config.read().await;
     if !Arc::ptr_eq(&current, cfg) {
         return None;

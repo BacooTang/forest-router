@@ -1,19 +1,16 @@
 use crate::{config::Config, state::State};
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 pub struct App {
     pub metrics: Arc<std::sync::Mutex<crate::telemetry::Metrics>>,
-    pub inflight: std::sync::Mutex<HashSet<String>>,
+    pub inflight: std::sync::Mutex<HashMap<String, CheckStatus>>,
     pub persist: Mutex<()>,
     pub config: RwLock<Arc<Config>>,
     pub state: Mutex<State>,
     pub client: reqwest::Client,
     pub system_client: std::sync::RwLock<reqwest::Client>,
     pub admin_requests: Arc<Semaphore>,
+    pub admin_reads: Arc<Semaphore>,
     pub checks: Arc<Semaphore>,
     pub knowledge_checks: Arc<Semaphore>,
     pub login_slots: Arc<Semaphore>,
@@ -26,6 +23,18 @@ pub struct App {
 pub struct CheckGuard<'a> {
     app: &'a App,
     id: String,
+}
+#[derive(Clone, serde::Serialize)]
+pub struct CheckStatus {
+    started_at: i64,
+    phase: &'static str,
+}
+impl CheckGuard<'_> {
+    pub fn running(&self) {
+        if let Some(status) = self.app.inflight.lock().unwrap().get_mut(&self.id) {
+            status.phase = "running";
+        }
+    }
 }
 impl Drop for CheckGuard<'_> {
     fn drop(&mut self) {
@@ -68,9 +77,17 @@ impl App {
     }
 
     pub fn begin(&self, id: String) -> Option<CheckGuard<'_>> {
-        if !self.inflight.lock().unwrap().insert(id.clone()) {
+        let mut inflight = self.inflight.lock().unwrap();
+        if inflight.contains_key(&id) {
             return None;
         }
+        inflight.insert(
+            id.clone(),
+            CheckStatus {
+                started_at: chrono::Utc::now().timestamp(),
+                phase: "queued",
+            },
+        );
         Some(CheckGuard { app: self, id })
     }
     pub async fn persist(&self) -> Result<(), String> {

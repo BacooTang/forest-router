@@ -64,7 +64,9 @@ class Upstream(http.server.BaseHTTPRequestHandler):
   if self.path.startswith('/timeout/'):
    self.send_response(504);self.send_header('Content-Length','0');self.end_headers();return
   if self.path.startswith('/bad/'):
-   self.send_response(503);self.send_header('Content-Length','0');self.end_headers();return
+   self.send_response(500);self.send_header('Content-Length','0');self.end_headers();return
+  if self.path.startswith('/gateway/'):
+   status=int(self.path.split('/')[2]);self.send_response(status);self.send_header('Content-Length','0');self.end_headers();return
   if self.path.startswith('/empty/'):
    b=b'{"error":{"code":"insufficient_quota"}}';self.send_response(429);self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
   if d.get('stream'):
@@ -214,9 +216,69 @@ def main():
    monitor_started.clear();monitor_delay=1
    checks=[];worker=threading.Thread(target=lambda:checks.append(request('/admin/api/verify',{'monitor_id':'quality'})[0]));worker.start()
    assert monitor_started.wait(5)
+   running=json.loads(request('/admin/api/state')[1])['checks']['monitor:quality']
+   assert running['phase']=='running' and running['started_at']>0,running
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==409
    worker.join();assert checks==[200];monitor_delay=0
    assert json.loads(request('/admin/api/state')[1])['state']['quality']['quality']['error_streak']==0
+   # Saving during a slow check releases the obsolete round promptly, and
+   # the discarded result cannot overwrite the new monitor configuration.
+   cfg['models'][0]['channels'][0]['monitor_id']=None;assert request('/admin/api/save',cfg)[0]==200
+   monitor_started.clear();monitor_delay=4
+   checks=[];worker=threading.Thread(target=lambda:checks.append(request('/admin/api/verify',{'monitor_id':'quality'})[0]));worker.start()
+   assert monitor_started.wait(5)
+   started=time.monotonic();cfg['monitors'][0]['reasoning_effort']='xhigh';assert request('/admin/api/save',cfg)[0]==200
+   worker.join(2.5);assert not worker.is_alive() and checks==[409],checks
+   assert time.monotonic()-started<2.5
+   assert 'quality' not in json.loads(request('/admin/api/state')[1])['state']['quality']
+   monitor_delay=0
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   fresh=json.loads(request('/admin/api/state')[1])['state']['quality']['quality']
+   assert fresh['verdict']=='healthy'
+   time.sleep(4)
+   assert json.loads(request('/admin/api/state')[1])['state']['quality']['quality']==fresh
+   # An unbound manual monitor must run while an unrelated whole round is
+   # active. Duplicate checks of the same monitor still return conflict.
+   independent=dict(cfg['monitors'][0],id='independent',name='independent',force_check=False)
+   cfg['monitors'].extend([dict(independent,id='blocker',name='blocker'),independent]);assert request('/admin/api/save',cfg)[0]==200
+   monitor_started.clear();monitor_delay=3
+   before=sum(path.endswith('/chat/completions') for path,h,d in seen)
+   checks=[];worker=threading.Thread(target=lambda:checks.append(request('/admin/api/verify',{'all_monitors':True})[0]));worker.start()
+   assert monitor_started.wait(5)
+   deadline=time.monotonic()+2
+   while sum(path.endswith('/chat/completions') for path,h,d in seen)<before+2 and time.monotonic()<deadline:time.sleep(.02)
+   assert sum(path.endswith('/chat/completions') for path,h,d in seen)>=before+2
+   # The two active monitors are guarded, but an unbound monitor queued
+   # behind them can be started manually without acquiring the round lock.
+   assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==409
+   monitor_delay=0
+   assert request('/admin/api/verify',{'monitor_id':'independent'})[0]==200
+   assert worker.is_alive(), 'unrelated manual monitor waited for slow check'
+   assert json.loads(request('/admin/api/state')[1])['state']['quality']['independent']['verdict']=='healthy'
+   worker.join();assert checks==[200]
+   cfg['monitors']=cfg['monitors'][:1];assert request('/admin/api/save',cfg)[0]==200
+   # Long admin operations must not consume the read pool. Eight slow
+   # independent checks occupy every write slot while status stays readable.
+   cfg['monitors'].extend(dict(independent,id=f'busy-{i}',name=f'busy-{i}') for i in range(8))
+   assert request('/admin/api/save',cfg)[0]==200
+   monitor_delay=2;busy=[]
+   workers=[threading.Thread(target=lambda i=i:busy.append(request('/admin/api/verify',{'monitor_id':f'busy-{i}'})[0])) for i in range(8)]
+   for thread in workers:thread.start()
+   deadline=time.monotonic()+1.5
+   while time.monotonic()<deadline:
+    status,raw=request('/admin/api/state');assert status==200
+    active=json.loads(raw)['checks']
+    if sum(f'monitor:busy-{i}' in active for i in range(8))==8:break
+    time.sleep(.02)
+   assert sum(f'monitor:busy-{i}' in active for i in range(8))==8,active
+   assert any(active[f'monitor:busy-{i}']['phase']=='queued' for i in range(8))
+   for thread in workers:thread.join()
+   assert busy==[200]*8,busy
+   monitor_delay=0
+   active=json.loads(request('/admin/api/state')[1])['checks']
+   assert not any(f'monitor:busy-{i}' in active for i in range(8)),active
+   cfg['monitors']=cfg['monitors'][:1];assert request('/admin/api/save',cfg)[0]==200
+   cfg['models'][0]['channels'][0]['monitor_id']='quality';assert request('/admin/api/save',cfg)[0]==200
    candy_answer='20';assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    before=len(seen)
    assert request('/v1/responses',payload,True)[0]==503
@@ -286,8 +348,22 @@ def main():
    key=json.loads(request('/admin/api/state')[1])['state']['keys']['timeout-key']
    assert key['confirmation_failures']>=1 and key['probe_attempts']==0 and key['suspect'] and not key['service_failed'],key
 
+   # A gateway failure must not globally isolate the only provider. Each
+   # request tries each key once; independent probes still confirm an outage.
+   for code in (502,503,524):
+    cfg['models'][0]['channels']=[channel('gateway',f'gateway/{code}')];assert request('/admin/api/save',cfg)[0]==200
+    for _ in range(2):
+     before=sum(path==f'/gateway/{code}/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)
+     assert request('/v1/responses',payload,True)[0]==503
+     assert sum(path==f'/gateway/{code}/v1/responses' and d.get('input')!='Reply OK.' for path,h,d in seen)==before+1
+     key=json.loads(request('/admin/api/state')[1])['state']['keys']['gateway-key']
+     assert key['suspect'] and not key['service_failed'],key
+    assert request('/admin/api/verify',{'channel_id':'gateway'})[0]==200
+    key=json.loads(request('/admin/api/state')[1])['state']['keys']['gateway-key']
+    assert key['confirmation_failures']>=1 and key['suspect'] and not key['service_failed'],key
+
    # Non-2xx probe bodies must distinguish credentials/quota from service faults.
-   cfg['models'][0]['channels']=[channel('probe-503','bad')];assert request('/admin/api/save',cfg)[0]==200
+   cfg['models'][0]['channels']=[channel('probe-503','gateway/503')];assert request('/admin/api/save',cfg)[0]==200
    for _ in range(2):
     assert request('/admin/api/verify',{'channel_id':'probe-503'})[0]==200
    key=json.loads(request('/admin/api/state')[1])['state']['keys']['probe-503-key']

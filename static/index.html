@@ -34,6 +34,9 @@ dialog.knowledge-dialog{width:min(1120px,94vw)}.knowledge-grid{display:grid;grid
 <script>
 'use strict';
 let checkingAll=false,draggingChannel=false;
+const checkingMonitors=new Set();
+const checkingChannels=new Set();
+let savingConfig=false;
 const knowledgeRuns=new Map(),knowledgeEfforts=[["medium","中度思考"],["high","高级思考"],["xhigh","XHigh"]];
 let data=null,view='配置中心',selected='',editing=false,refreshing=false,noticeTimer;
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),uid=()=>globalThis.crypto?.randomUUID?.()||'id-'+Date.now().toString(36)+Math.random().toString(36).slice(2),clone=x=>JSON.parse(JSON.stringify(x));
@@ -45,7 +48,7 @@ matchMedia('(max-width:740px)').addEventListener('change',()=>setDrawer(false));
 const badges={healthy:['满血','green'],degraded:['降智','purple'],unknown:['检测异常','orange']};
 const adapters={auto:'自动识别',new_api:'New API',sub2_api:'Sub2API',subscription:'订阅额度',deepseek:'DeepSeek 官方',glm:'智谱 Coding Plan'};
 function toast(message){$('notice').textContent=message;$('notice').classList.remove('hidden');clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>$('notice').classList.add('hidden'),6000)}
-async function api(path,body){const r=await fetch('/admin/api/'+path,{method:body===undefined?'GET':'POST',headers:{'content-type':'application/json','x-forest-admin':'1'},body:body===undefined?undefined:JSON.stringify(body)});if(r.status===401){$('login').classList.remove('hidden');$('app').classList.add('hidden');throw Error('请登录管理员账号')}if(!r.ok){let text=await r.text();try{text=JSON.parse(text).error||text}catch{}throw Error(text||'操作失败')}return r.json()}
+async function api(path,body){let r;try{r=await fetch('/admin/api/'+path,{method:body===undefined?'GET':'POST',headers:{'content-type':'application/json','x-forest-admin':'1'},body:body===undefined?undefined:JSON.stringify(body),...(body===undefined?{signal:AbortSignal.timeout(15000)}:{})})}catch(e){throw Error(body===undefined?'读取状态失败，请检查网络后重试':'连接中断，操作结果未确认，请刷新状态后再决定是否重试')}if(r.status===401){$('login').classList.remove('hidden');$('app').classList.add('hidden');throw Error('请登录管理员账号')}if(!r.ok){let text=await r.text();try{text=JSON.parse(text).error||text}catch{}throw Error(text||('操作失败（HTTP '+r.status+'）'))}return r.json()}
 function toggle(enabled,action,id,label){return `<button type="button" role="switch" aria-checked="${enabled}" aria-label="${esc(label)}" title="${enabled?'点击停用':'点击启用'}" class="toggle ${enabled?'on':''}" data-action="${action}" data-id="${esc(id)}"></button>`}
 function badge(t,c=''){return `<span class="badge ${c}">${esc(t)}</span>`}function stamp(t){return t?new Date(t*1000).toLocaleString('zh-CN',{hour12:false}):'尚未检查'}
 function keyReason(s={}){const n=Date.now()/1000;if(s.credential_failed)return ['凭证失效','red'];if(s.allowance?.exhausted||(s.allowance?.expires_at&&s.allowance.expires_at<=n))return ['额度耗尽','orange'];if(s.probe_exhausted)return ['服务异常，按时段自动复查','orange'];if(s.service_failed)return ['服务不可用，自动恢复中','red'];if(s.retry_at>n)return ['限流等待','orange'];if(s.suspect)return ['网络异常确认中，继续可用','orange'];return ['可用','green']}
@@ -62,9 +65,10 @@ function serviceStatus(c){
 function serviceBadge(c){const [label,color]=serviceStatus(c);const keys=c.keys.filter(k=>k.enabled!==false);const detail=!c.enabled?'提供者已关闭':!keys.length?'全部Key已关闭':keys.map(k=>(k.label||'Key')+'：'+(keyReason(data.state.keys[k.id]||{})[0]==='可用'&&!data.state.keys[k.id]?.checked?'尚无成功的服务验证记录':keyReason(data.state.keys[k.id]||{})[0])).join('；');return `<span class="badge ${color}" title="${esc(detail)}">${label}</span>`}
 function reason(c){if(!c.enabled)return ['已停用',''];if(!c.keys.some(k=>k.enabled!==false))return ['全部Key已停用',''];const q=data.state.quality[c.monitor_id];if(c.monitor_id&&!(q?.last_definite==='healthy'&&q.valid_until>Date.now()/1000))return quality(c);const states=c.keys.filter(k=>k.enabled!==false).map(k=>data.state.keys[k.id]||{}),reasons=states.map(keyReason);if(reasons.some(r=>['可用','网络异常确认中，继续可用'].includes(r[0])))return ['可用','green'];return reasons[0]||['全部Key已停用','']}
 function allowance(a){if(!a)return '额度未知';if(a.windows?.length)return a.windows.map(w=>`${w.label} 剩余 ${w.remaining_percent??'?'}%${w.resets_at?' · 重置 '+new Date(w.resets_at).toLocaleString():''}`).join(' / ');if(a.unlimited)return 'Key 无限额度 · 账号余额未知';return a.remaining!=null?`${Number(a.remaining).toFixed(2)} ${a.unit==='quota'?'额度单位':a.unit}`:'额度未知'}
-async function refresh(){if(document.body.classList.contains('drawer-open')||draggingChannel||document.querySelector('.timeline:hover,.timeline:focus-within,.monitor-details[open],.trace-detail[open],.client-history[open],#traceSearch:focus')||refreshing||editing||$('dialog').open)return;refreshing=true;try{data=await api('state');$('login').classList.add('hidden');$('app').classList.remove('hidden');render()}catch(e){if(data)toast('状态刷新失败，稍后自动重试')}finally{refreshing=false}}
+async function refresh(force=false){if(refreshing||savingConfig||editing||$('dialog').open)return;refreshing=true;const revision=data?.config?._revision;try{const fresh=await api('state');if(savingConfig||editing||$('dialog').open||revision!==data?.config?._revision)return;data=fresh;$('login').classList.add('hidden');$('app').classList.remove('hidden');if(!document.body.classList.contains('drawer-open')&&!draggingChannel&&(force||!document.querySelector('.timeline:hover,.timeline:focus-within,.monitor-details[open],.trace-detail[open],.client-history[open],#traceSearch:focus')))render();else bindActions($('content'))}catch(e){if(data)toast(e.message)}finally{refreshing=false}}
 $('loginForm').onsubmit=async e=>{e.preventDefault();try{await api('login',{password:$('password').value});$('password').value='';await refresh()}catch(e){toast(e.message)}};
-function bindActions(root){root.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>action(b.dataset.action,b.dataset.id,b))}
+function checkLabel(task){return (task.phase==='running'?'检测执行中':'等待检查名额')+' · '+Math.max(0,Math.floor(Date.now()/1000-task.started_at))+'秒'}
+function bindActions(root){root.querySelectorAll('[data-action]').forEach(b=>{const id=b.dataset.id,a=b.dataset.action,task=data?.checks?.['monitor:'+id];if(a==='verify-monitor'){b.disabled=checkingMonitors.has(id)||!!task;b.textContent=task?checkLabel(task):checkingMonitors.has(id)?'检测中（含排队）…':'重新检测'}if(a==='verify'){const active=checkingChannels.has(id)||data?.checks?.['manual:'+id];b.disabled=!!active;b.textContent=active?'验证中（含排队）…':'重新验证'}if(a==='verify-all-monitors'){b.disabled=checkingAll||!!data?.checks?.['monitor-round']||!data?.config.monitors.length;b.textContent=checkingAll||data?.checks?.['monitor-round']?'整轮检测中…':'立即检测'}b.onclick=()=>action(a,id,b)})}
 function shortTime(t){return t?new Date(t*1000).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'尚未检查'}
 function chartTime(t){return new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}
 function timeline(history,end){
@@ -119,7 +123,7 @@ function bindChannelDrag(root){
   handle.onkeydown=async e=>{if(!['ArrowUp','ArrowDown'].includes(e.key)||draggingChannel)return;e.preventDefault();const id=handle.closest('[data-channel-id]').dataset.channelId;draggingChannel=true;try{await action(e.key==='ArrowUp'?'up':'down',id,handle)}finally{draggingChannel=false}};
  }
 }
-async function saveConfig(cfg){const result=await api('save',cfg);editing=false;if(result.reauthenticate){$('login').classList.remove('hidden');$('app').classList.add('hidden');toast('密码已修改，请重新登录');return}data=await api('state');render();toast('已保存，新请求立即生效')}
+async function saveConfig(cfg){if(savingConfig)throw Error('配置正在保存，请等待完成');savingConfig=true;const buttons=[...document.querySelectorAll('button[type="submit"],#settingsForm button')].map(b=>({b,disabled:b.disabled,text:b.textContent}));buttons.forEach(({b})=>{b.disabled=true;b.textContent='保存中…'});try{const result=await api('save',cfg);editing=false;if(result.reauthenticate){$('login').classList.remove('hidden');$('app').classList.add('hidden');toast('密码已修改，请重新登录');return}data.config={...cfg,_revision:result.revision};delete data.config.new_password;try{data=await api('state');render();toast('已保存，新请求立即生效')}catch(e){toast('配置已保存，但状态刷新失败；请稍后刷新，不必重复保存')}}finally{savingConfig=false;buttons.forEach(({b,disabled,text})=>{b.disabled=disabled;b.textContent=text})}}
 function openDialog(html){$('dialogContent').innerHTML=html;$('dialog').classList.toggle('knowledge-dialog',!!$('knowledgeResults'));$('dialog').showModal();$('dialogContent').querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>$('dialog').close())}
 function field(label,id,value='',type='text'){return `<div class="field"><label for="${id}">${label}</label><input id="${id}" type="${type}" value="${esc(value)}"></div>`}
 function formFoot(extra=''){return `<div class="formfoot">${extra}<span class="spacer"></span><button type="button" data-close>取消</button><button class="primary" type="submit">保存</button></div>`}
@@ -217,11 +221,16 @@ async function action(a,id,b){try{
   if(checkingAll)return;const monitors=[...data.config.monitors];if(!monitors.length)return;
   checkingAll=true;render();let completed=0;const errors=[];
   try{const result=await api('verify',{all_monitors:true});completed=result.completed;if(completed<monitors.length)errors.push('部分监控忙碌或配置已变化')}catch(e){errors.push(e.message)}
-  finally{checkingAll=false;await refresh();if(view==='降智监控')render()}
+  finally{checkingAll=false;await refresh(true);if(view==='降智监控')render()}
   toast('检测执行完成 '+completed+' / '+monitors.length+(errors.length?'；'+errors.join('；'):'，状态已更新'));
  }
  else if(a==='knowledge-monitor'){knowledgeDialog(data.config.monitors.find(m=>m.id===id))}
- else if(['verify','verify-monitor'].includes(a)){b.disabled=true;b.textContent='验证中…';await api('verify',a==='verify-monitor'?{monitor_id:id}:{channel_id:id});toast('验证完成，状态已更新');await refresh()}
+ else if(a==='verify-monitor'){
+  if(checkingMonitors.has(id))return;checkingMonitors.add(id);render();
+  try{await api('verify',{monitor_id:id});toast('检测已完成，请查看该项结论；完成不代表通过')}
+  finally{checkingMonitors.delete(id);await refresh(true);if(view==='降智监控')render()}
+ }
+ else if(a==='verify'){if(checkingChannels.has(id))return;checkingChannels.add(id);bindActions($('content'));try{await api('verify',{channel_id:id});toast('验证已完成，请查看服务、额度和质量状态')}finally{checkingChannels.delete(id);await refresh(true);bindActions($('content'))}}
  }catch(e){toast(e.message)}finally{if(b)b.disabled=false}}
 setInterval(refresh,5000);refresh();
 </script></body></html>

@@ -132,6 +132,7 @@ async fn main() {
         client: upstream::client(false).expect("http client"),
         system_client: std::sync::RwLock::new(upstream::client(true).expect("system proxy client")),
         admin_requests: Arc::new(Semaphore::new(8)),
+        admin_reads: Arc::new(Semaphore::new(4)),
         checks: Arc::new(Semaphore::new(4)),
         knowledge_checks: Arc::new(Semaphore::new(3)),
         login_slots: Arc::new(Semaphore::new(1)),
