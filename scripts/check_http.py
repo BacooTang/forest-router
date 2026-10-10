@@ -99,11 +99,38 @@ def main():
      assert e.headers.get('X-Request-ID','').startswith('fr_')
      request.last_id=e.headers['X-Request-ID']
     return e.code,e.read()
+  anonymous=urllib.request.build_opener()
+  def public_state():
+   with anonymous.open(base+'/monitor/api/state',timeout=20) as r:
+    assert r.status==200 and r.headers['Cache-Control']=='no-store'
+    assert r.headers['X-Content-Type-Options']=='nosniff'
+    raw=r.read();v=json.loads(raw)
+   assert set(v)=={'updated_at','schedule','monitors'} and v['updated_at']>0
+   for m in v['monitors']:
+    assert set(m)=={'id','name','model','reasoning_effort','knowledge_check','automatically_scheduled','quality','check'}
+    if m['quality'] is not None:
+     assert set(m['quality'])=={'verdict','last_definite','checked_at','valid_until','next_at','response_ms','history'}
+   assert all(secret not in raw.decode() for secret in ('monitor-key','company-secret','upstream-secret','test-password','base_url','webhook','allowance','permission_denied','model access disabled'))
+   return v
   try:
    for _ in range(100):
     try:request('/');break
     except OSError:time.sleep(.05)
    assert request('/admin/api/state')[0]==401
+   for path in ('/monitor','/monitor/'):
+    with anonymous.open(base+path,timeout=20) as r:
+     assert r.status==200 and '<title>降智监控' in r.read().decode()
+   assert public_state()['monitors']==[]
+   for path in ('/monitor','/monitor/api/state'):
+    try:
+     anonymous.open(urllib.request.Request(base+path,data=b'{}',headers={'content-type':'application/json'}))
+     raise AssertionError('public route accepted a write')
+    except urllib.error.HTTPError as e:assert e.code==405
+   for path in ('/admin/api/save','/admin/api/verify','/admin/api/detect','/admin/api/knowledge'):
+    try:
+     anonymous.open(urllib.request.Request(base+path,data=b'{}',headers={'content-type':'application/json','x-forest-admin':'1'}))
+     raise AssertionError('anonymous admin mutation accepted')
+    except urllib.error.HTTPError as e:assert e.code==401
    assert request('/v1/models')[0]==401
    assert json.loads(request('/v1/models',auth=True)[1])=={'object':'list','data':[]}
    assert request('/admin/api/login',{'password':'test-password'})[0]==200
@@ -177,6 +204,8 @@ def main():
    cfg['webhook']=f'http://127.0.0.1:{up}/hook';cfg['monitors']=[{'id':'quality','name':'quality','base_url':f'http://127.0.0.1:{up}/v1','key':'monitor-key','model':'test'}]
    assert request('/admin/api/save',cfg)[0]==200
    assert json.loads(request('/admin/api/state')[1])['config']['monitors'][0]['reasoning_effort']=='high'
+   m=public_state()['monitors'][0]
+   assert m['id']=='quality' and m['quality'] is None and not m['automatically_scheduled']
    bad=json.loads(json.dumps(cfg));bad['monitors'][0]['reasoning_effort']='invalid'
    assert request('/admin/api/save',bad)[0]==400
    for effort in ('high','low','medium','xhigh','high'):
@@ -186,8 +215,11 @@ def main():
     assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
     assert seen[-1][0]=='/v1/chat/completions' and seen[-1][2]['reasoning_effort']==effort
     assert json.loads(request('/admin/api/state')[1])['state']['quality']['quality']['verdict']=='healthy'
+   m=public_state()['monitors'][0]
+   assert m['quality']['verdict']=='healthy' and m['quality']['history'] and m['check'] is None
    cfg['models'][0]['channels']=[channel('watched','ok')];cfg['models'][0]['channels'][0]['monitor_id']='quality';assert request('/admin/api/save',cfg)[0]==200
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
+   assert public_state()['monitors'][0]['automatically_scheduled']
    assert request('/v1/responses',payload,True)[0]==200
    cfg['webhook']=''
    cfg['monitors'][0]['knowledge_check']=True;assert request('/admin/api/save',cfg)[0]==200
@@ -197,6 +229,8 @@ def main():
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==200
    q=json.loads(request('/admin/api/state')[1])['state']['quality']['quality']
    assert q['verdict']=='degraded' and '知识库未通过：24/25' in q['error']
+   m=public_state()['monitors'][0]
+   assert m['quality']['verdict']=='degraded' and m['knowledge_check']
    before=len(seen);assert request('/v1/responses',payload,True)[0]==503
    assert len(seen)==before, 'knowledge failure did not exclude the bound channel'
    knowledge_answer=knowledge_answer.replace('Q25｜不清楚','Q25｜有效回答')
@@ -212,12 +246,15 @@ def main():
    assert all(x in error for x in ('HTTP 403 Forbidden','上游拒绝访问','code=permission_denied','message=model access disabled')),error
    assert q['verdict']=='unknown'
    assert q['error_streak']==1 and q['next_at']<=q['checked_at']+60 and q['valid_until']==valid_before,q
+   m=public_state()['monitors'][0]
+   assert m['quality']['verdict']=='unknown' and m['quality']['valid_until']==valid_before
    monitor_error=None
    monitor_started.clear();monitor_delay=1
    checks=[];worker=threading.Thread(target=lambda:checks.append(request('/admin/api/verify',{'monitor_id':'quality'})[0]));worker.start()
    assert monitor_started.wait(5)
    running=json.loads(request('/admin/api/state')[1])['checks']['monitor:quality']
    assert running['phase']=='running' and running['started_at']>0,running
+   assert public_state()['monitors'][0]['check']['phase']=='running'
    assert request('/admin/api/verify',{'monitor_id':'quality'})[0]==409
    worker.join();assert checks==[200];monitor_delay=0
    assert json.loads(request('/admin/api/state')[1])['state']['quality']['quality']['error_streak']==0

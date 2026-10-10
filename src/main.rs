@@ -8,6 +8,7 @@ mod knowledge;
 mod monitor;
 mod notifications;
 mod proxy;
+mod public_monitor;
 mod scheduler;
 mod sse;
 mod state;
@@ -156,6 +157,9 @@ async fn main() {
     let app_shutdown = app.clone();
     let admin_router = Router::new()
         .route("/", get(admin::index))
+        .route("/monitor", get(public_monitor::index))
+        .route("/monitor/", get(public_monitor::index))
+        .route("/monitor/api/state", get(public_monitor::state))
         .route("/admin/api/login", post(admin::login))
         .route("/admin/api/state", get(admin::state))
         .route("/admin/api/save", post(admin::save))

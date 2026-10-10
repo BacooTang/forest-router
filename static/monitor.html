@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>降智监控 · Forest Router</title>
+<style>
+:root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#263d34;background:#f3f6f3;font-size:14px}*{box-sizing:border-box}body{margin:0}main{max-width:1280px;margin:0 auto;padding:20px}.panel{background:white;border:1px solid #e0e8e1;border-radius:13px;padding:20px}.row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.between{justify-content:space-between}h1{font-size:22px;margin:0}h2{font-size:15px;margin:0;overflow-wrap:anywhere}.muted{color:#7c9084;font-size:12px}.badge{display:inline-block;border-radius:5px;padding:4px 7px;font-size:11px;background:#eff3f0;color:#74847a}.green{background:#e1f3e6;color:#197a42}.purple{background:#f0e6fa;color:#8851b3}.orange{background:#fff0d7;color:#a87319}.blue{background:#e8f0fd;color:#547ab7}.summary{background:#f2f8f3;border:1px solid #e0ebe1;border-radius:9px;padding:12px 14px;margin:16px 0;color:#617868;font-size:12px;line-height:1.8}.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:5px}.legend span{display:flex;align-items:center;gap:5px}.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;background:#dce5df}.legend .healthy{background:#70b888}.legend .degraded{background:#ab77d0}.legend .unknown{background:#edc579}.monitor-card{border:1px solid #e1e8e1;border-radius:11px;margin:12px 0;padding:14px 16px}.monitor-meta{margin-left:auto;overflow-wrap:anywhere}.timeline{margin:13px 0 9px}.bars{display:grid;grid-template-columns:repeat(72,minmax(0,1fr));gap:3px;height:28px}.bar{min-width:0;border-radius:2px;background:#dce5df}.bar.healthy{background:#70b888}.bar.degraded{background:#ab77d0}.bar.unknown{background:#edc579}.bar:hover,.bar:focus-visible{outline:2px solid #526b5c;outline-offset:2px}.time-axis{position:relative;height:16px;margin-top:5px;overflow:hidden}.time-axis span{position:absolute;transform:translateX(-50%);font-size:10px;color:#91a097;white-space:nowrap}.monitor-footer{display:flex;gap:8px 20px;flex-wrap:wrap;line-height:1.7}.empty{text-align:center;padding:40px 15px;color:#83948a}.notice{color:#a87319;font-size:12px;line-height:1.7;margin:10px 0}.hidden{display:none}.chart-tooltip{position:fixed;max-width:min(360px,calc(100vw - 16px));padding:9px 11px;border-radius:8px;background:#304e3d;color:white;font-size:12px;line-height:1.7;white-space:pre-wrap;pointer-events:none;box-shadow:0 3px 20px #0002;z-index:10}
+@media(max-width:600px){main{padding:10px}.panel{padding:14px}h1{font-size:20px}.monitor-card{padding:12px}.monitor-meta{width:100%;margin-left:0}.bars{gap:2px}.monitor-footer{gap:4px 12px}}
+</style>
+</head>
+<body>
+<main><article class="panel">
+<header class="row between"><div class="row"><h1>降智监控</h1><span class="badge">只读</span></div><span id="updated" class="muted">正在读取状态…</span></header>
+<div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+<div class="summary"><div id="schedule">上海时间 · 每 5 秒自动刷新</div><div class="legend"><span><i class="healthy"></i>满血</span><span><i class="degraded"></i>降智</span><span><i class="unknown"></i>检测异常</span><span><i></i>无数据／中断</span><span>最近 6 小时 · 每柱 5 分钟</span></div></div>
+<div id="monitors"><p class="empty">正在加载监控…</p></div>
+</article></main>
+<div id="tooltip" class="chart-tooltip hidden" role="tooltip"></div>
+<script>
+'use strict';
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const verdicts={healthy:['满血','green'],degraded:['降智','purple'],unknown:['检测异常','orange']};
+let data=null,refreshing=false,timer;
+function stamp(t){return t?new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'尚未检查'}
+function time(t){return new Date(t*1000).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,hour:'2-digit',minute:'2-digit'})}
+function periodTime(t){return String(Math.floor(t/60)).padStart(2,'0')+':'+String(t%60).padStart(2,'0')}
+function badge(label,color=''){return `<span class="badge ${color}">${esc(label)}</span>`}
+function qualityBadge(q,now){
+ if(!q?.checked_at)return ['等待检测',''];
+ if(q.verdict==='degraded'||q.last_definite==='degraded')return [q.verdict==='unknown'?'检测异常 · 上次降智':'降智','purple'];
+ if(q.last_definite==='healthy'&&q.valid_until<=now)return ['结果过期，等待复查','orange'];
+ if(q.verdict==='unknown')return [q.last_definite==='healthy'?'检测异常 · 上次满血仍有效':'检测异常','orange'];
+ return verdicts[q.verdict]||['等待检测',''];
+}
+function timeline(history,end){
+ const start=end-71*300,slots=new Map();
+ for(const point of history){const slot=Math.floor(point.at/300)*300;if(slot>=start&&slot<=end){const list=slots.get(slot)||[];list.push(point);slots.set(slot,list)}}
+ let bars='',ticks='';
+ for(let i=0;i<72;i++){
+  const at=start+i*300,points=(slots.get(at)||[]).sort((a,b)=>a.at-b.at),last=points.at(-1),color=last&&verdicts[last.verdict]?last.verdict:'';
+  const text=points.length?points.map(p=>stamp(p.at)+' · '+(verdicts[p.verdict]?.[0]||'未知')).join('\n'):stamp(at)+'–'+time(at+300)+' · 无数据／中断';
+  bars+=`<span class="bar ${color}" tabindex="0" role="img" data-chart-tip="${esc(text)}" aria-label="${esc(text)}"></span>`;
+  if(at%3600===0)ticks+=`<span style="left:${(i+.5)/72*100}%">${time(at)}</span>`;
+ }
+ return `<div class="timeline"><div class="bars">${bars}</div><div class="time-axis">${ticks}</div></div>`;
+}
+function render(){
+ if(!data)return;
+ const now=data.updated_at+Math.max(0,Math.floor((Date.now()-data.received_at)/1000)),end=Math.floor(now/300)*300;
+ const schedule=data.schedule.map(p=>periodTime(p.start)+'–'+periodTime(p.end)+' / '+p.interval_minutes+'分钟').join('；');
+ $('schedule').textContent='上海时间 · '+schedule+'；其余20分钟 · 每 5 秒自动刷新';
+ $('monitors').innerHTML=data.monitors.map(m=>{
+  const q=m.quality,task=m.check;
+  const progress=task?badge((task.phase==='running'?'检测执行中':'等待检查名额')+' · '+Math.max(0,now-task.started_at)+'秒','blue'):'';
+  const next=m.automatically_scheduled?(q?.next_at?stamp(q.next_at):'等待调度'):'未自动调度';
+  return `<section class="monitor-card"><div class="row"><h2>${esc(m.name)}</h2>${badge(...qualityBadge(q,now))}${progress}<span class="muted monitor-meta">${esc(m.model)} · ${esc(m.reasoning_effort)} · ${m.knowledge_check?'糖果题＋知识库':'糖果题'}</span></div>${timeline(q?.history||[],end)}<div class="monitor-footer muted"><span>上次 ${esc(stamp(q?.checked_at))}</span><span>下次 ${esc(next)}</span><span>耗时 ${q?.response_ms!=null?(q.response_ms/1000).toFixed(1)+' 秒':'—'}</span>${q?.last_definite==='healthy'&&q.valid_until>now?`<span>满血有效至 ${esc(stamp(q.valid_until))}</span>`:''}</div></section>`;
+ }).join('')||'<p class="empty">暂无降智监控</p>';
+ $('tooltip').classList.add('hidden');
+}
+function showTip(target){
+ if(!target?.matches('[data-chart-tip]'))return;
+ const tip=$('tooltip');tip.textContent=target.dataset.chartTip;tip.classList.remove('hidden');
+ const r=target.getBoundingClientRect(),box=tip.getBoundingClientRect();tip.style.left=Math.max(8,Math.min(r.left,innerWidth-box.width-8))+'px';tip.style.top=Math.max(8,r.top-box.height-8)+'px';
+}
+document.addEventListener('pointerover',e=>showTip(e.target));document.addEventListener('focusin',e=>showTip(e.target));
+for(const event of ['pointerout','focusout'])document.addEventListener(event,e=>{if(e.target.matches('[data-chart-tip]'))$('tooltip').classList.add('hidden')});
+async function refresh(){
+ if(refreshing)return;refreshing=true;clearTimeout(timer);
+ try{
+  const response=await fetch('/monitor/api/state',{credentials:'omit',cache:'no-store',signal:AbortSignal.timeout(15000)});
+  if(!response.ok)throw Error();
+  data=await response.json();data.received_at=Date.now();
+  $('updated').textContent='更新于 '+stamp(data.updated_at);$('notice').classList.add('hidden');
+  if(!document.querySelector('.timeline:hover,.timeline:focus-within'))render();
+ }catch{
+  $('notice').textContent=data?'状态刷新失败，当前显示上次数据；正在自动重试。':'暂时无法读取监控，正在自动重试。';$('notice').classList.remove('hidden');
+  if(!data)$('monitors').innerHTML='<p class="empty">等待连接恢复</p>';
+  else if(!document.querySelector('.timeline:hover,.timeline:focus-within'))render();
+ }finally{refreshing=false;timer=setTimeout(refresh,5000)}
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)void refresh()});
+void refresh();
+</script>
+</body>
+</html>

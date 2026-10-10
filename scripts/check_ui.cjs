@@ -1,5 +1,39 @@
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const fs=require('fs'),os=require('os'),path=require('path'),cp=require('child_process'),http=require('http');
+async function checkPublicMonitor(browser,port,errors){
+ const context=await browser.newContext({viewport:{width:1440,height:1000}}),page=await context.newPage(),base=`http://127.0.0.1:${port}`;
+ let adminRequests=0;page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(r.url().includes('/admin/'))adminRequests++});
+ try{
+  if((await context.request.get(base+'/admin/api/state')).status()!==401)throw Error('public context inherited login');
+  await page.goto(base+'/monitor');await page.locator('.monitor-card').getByText('降智',{exact:true}).waitFor();
+  if(await page.locator('button,input,form,nav,aside,a').count())throw Error('public monitor contains unrelated controls');
+  if((await page.locator('.monitor-card').textContent()).includes('fixture-key'))throw Error('public monitor leaked key');
+  await page.screenshot({path:path.join(__dirname,'../.runtime/ui-public-monitor.png'),fullPage:true});
+  const snapshot=await (await context.request.get(base+'/monitor/api/state')).json(),now=Math.floor(Date.now()/1000),source=snapshot.monitors[0];
+  source.quality.history=[{at:now-900,verdict:'healthy'},{at:now-600,verdict:'unknown'},{at:now-300,verdict:'degraded'}];
+  const make=(name,verdict,last,until=now+300)=>({...source,name,check:null,quality:{...source.quality,verdict,last_definite:last,valid_until:until}});
+  snapshot.monitors=[make('正常示例','healthy','healthy'),make('降智示例','degraded','degraded'),make('异常示例','unknown','healthy'),make('过期示例','healthy','healthy',now-60),make('未知示例','unknown',''),{...source,name:'<img src=x onerror="window.publicInjected=true">',quality:null,check:{phase:'queued',started_at:now-12}}];
+  let calls=0,fail=false;await page.route('**/monitor/api/state',route=>{calls++;return fail?route.fulfill({status:503,body:'fixture unavailable'}):route.fulfill({json:{...snapshot,updated_at:Math.floor(Date.now()/1000)}})});
+  await page.evaluate(()=>refresh());
+  for(const label of ['满血','降智','检测异常 · 上次满血仍有效','结果过期，等待复查','检测异常','等待检测'])await page.locator('.monitor-card .badge').getByText(label,{exact:true}).waitFor();
+  if(await page.locator('.monitor-card img').count()||await page.evaluate(()=>window.publicInjected))throw Error('public monitor failed to escape names');
+  await page.locator('.bar.healthy').first().focus();await page.locator('#tooltip:not(.hidden)').waitFor();
+  if(!(await page.locator('#tooltip').textContent()).includes('满血'))throw Error('public history tooltip missing verdict');
+  await page.locator('.bar.healthy').first().evaluate(e=>e.blur());
+  await page.screenshot({path:path.join(__dirname,'../.runtime/ui-public-monitor-states.png'),fullPage:true});
+  await page.setViewportSize({width:375,height:800});
+  if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))throw Error('public monitor mobile overflow');
+  await page.screenshot({path:path.join(__dirname,'../.runtime/ui-public-monitor-mobile.png'),fullPage:true});
+  const previous=calls;snapshot.monitors[0].quality.verdict='degraded';snapshot.monitors[0].quality.last_definite='degraded';
+  await page.locator('.monitor-card').filter({hasText:'正常示例'}).getByText('降智',{exact:true}).waitFor({timeout:10000});
+  if(calls<=previous)throw Error('public monitor did not automatically refresh');
+  fail=true;await page.evaluate(()=>refresh());await page.getByText('状态刷新失败，当前显示上次数据；正在自动重试。',{exact:true}).waitFor();
+  if(await page.locator('.monitor-card').count()!==6)throw Error('public refresh failure discarded snapshot');
+  await page.reload();await page.getByText('暂时无法读取监控，正在自动重试。',{exact:true}).waitFor();
+  fail=false;snapshot.monitors=[];await page.evaluate(()=>refresh());await page.getByText('暂无降智监控',{exact:true}).waitFor();
+  if(adminRequests||await page.locator('button,input,form,nav,aside,a').count())throw Error('public monitor used admin API or added controls');
+ }finally{await context.close()}
+}
 (async()=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'forest-ui-'));
  let knowledgeActive=0,knowledgePeak=0,knowledgeRequests=0,knowledgeMode='mixed';const knowledgeBodies=[],candyEfforts=[];
@@ -53,6 +87,7 @@ const fs=require('fs'),os=require('os'),path=require('path'),cp=require('child_p
   for(const effort of ['low','high']){await page.locator('[data-action="edit-monitor"]').click();await page.locator('#meffort').selectOption(effort);await page.locator('#monitorForm button[type=submit]').click();await page.locator('#dialog').waitFor({state:'hidden'});await page.locator('[data-action="verify-monitor"]').click();await page.locator('.monitor-card').getByText('满血',{exact:true}).waitFor();if(candyEfforts.at(-1)!==effort)throw Error('candy test ignored selected effort');await page.locator('[data-action="edit-monitor"]').click();if(await page.locator('#meffort').inputValue()!==effort)throw Error('monitor effort did not persist');if(effort==='high')await page.screenshot({path:path.join(__dirname,'../.runtime/ui-monitor-effort.png'),fullPage:true});await page.getByRole('button',{name:'取消',exact:true}).click()}
   await page.locator('[data-action="edit-monitor"]').click();await page.locator('#mknowledge').check();await page.locator('#meffort').selectOption('low');await page.setViewportSize({width:375,height:800});if(await page.locator('#dialog').evaluate(d=>d.scrollWidth>d.clientWidth))throw Error('monitor edit mobile overflow');await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:path.join(__dirname,'../.runtime/ui-monitor-options.png'),fullPage:true});await page.locator('#monitorForm button[type=submit]').click();await page.locator('#dialog').waitFor({state:'hidden'});
   const pairedStart=knowledgeRequests;await page.locator('[data-action="verify-monitor"]').click();await page.locator('.monitor-card').getByText('降智',{exact:true}).waitFor();if(knowledgeRequests!==pairedStart+1||knowledgeBodies.at(-1).reasoning_effort!=='low'||candyEfforts.at(-1)!=='low')throw Error('paired monitoring did not use selected effort');await page.locator('.monitor-card').getByText('知识库未通过：24/25 题已回答',{exact:true}).waitFor();
+  await checkPublicMonitor(browser,port,errors);
   await page.locator('[data-action="edit-monitor"]').click();if(!await page.locator('#mknowledge').isChecked()||await page.locator('#mforce').isChecked())throw Error('knowledge option did not persist');await page.locator('#mforce').check();await page.locator('#monitorForm button[type=submit]').click();await page.locator('#dialog').waitFor({state:'hidden'});if((await page.locator('.monitor-footer').textContent()).includes('未自动调度'))throw Error('forced monitor shown as unscheduled');await page.locator('[data-action="edit-monitor"]').click();if(!await page.locator('#mforce').isChecked())throw Error('force option did not persist');await page.locator('#mforce').uncheck();await page.locator('#mknowledge').uncheck();await page.locator('#monitorForm button[type=submit]').click();await page.locator('#dialog').waitFor({state:'hidden'});await page.locator('.monitor-card').getByText('等待检测',{exact:true}).waitFor();
   await page.locator('#nav button').filter({hasText:'日志'}).click();await page.getByRole('heading',{name:'事件日志'}).waitFor();if(!await page.locator('.log').textContent())throw Error('missing logs');
   await page.locator('#nav button').filter({hasText:'设置'}).click();if(await page.locator('#useSystemProxy').isChecked())throw Error('system proxy must default off');if(await page.locator('#notifyAllMonitors').isChecked())throw Error('summary must default off');await page.locator('#notifyAllMonitors').check();await page.locator('#apiKey').fill('changed-company-key');await page.getByRole('button',{name:'保存设置'}).click();await page.waitForTimeout(300);if(!await page.locator('#notifyAllMonitors').isChecked())throw Error('summary setting not retained');
