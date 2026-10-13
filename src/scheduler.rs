@@ -6,6 +6,7 @@ use crate::{
 };
 use futures_util::{StreamExt, stream};
 use std::{sync::Arc, time::Duration};
+const QUOTA_PROBE_INTERVAL: i64 = 1800;
 pub fn spawn(app: Arc<App>) {
     let balances = app.clone();
     tokio::spawn(async move {
@@ -137,7 +138,7 @@ pub async fn balance_check(
         &app.upstream_client(cfg.use_system_proxy),
         &c.base_url,
         &k.secret,
-        adapter,
+        adapter.clone(),
     )
     .await;
     let request_exhausted = app
@@ -153,6 +154,34 @@ pub async fn balance_check(
             && let Ok((_, a)) = &mut result
         {
             a.exhausted = true;
+        }
+    }
+    if adapter == Adapter::Subscription
+        && result
+            .as_ref()
+            .is_ok_and(|(_, a)| a.exhausted && a.remaining.is_some())
+    {
+        // Some subscription platforms only roll a new weekly window on a real
+        // request; an excluded key would otherwise report zero forever.
+        let now = chrono::Utc::now().timestamp();
+        let due = {
+            let mut state = app.state.lock().await;
+            let s = state.keys.entry(k.id.clone()).or_default();
+            let due = now - s.quota_probe_at >= QUOTA_PROBE_INTERVAL;
+            if due {
+                s.quota_probe_at = now;
+            }
+            due
+        };
+        if due {
+            health::probe(app, c, k).await;
+            result = upstream::allowance(
+                &app.upstream_client(cfg.use_system_proxy),
+                &c.base_url,
+                &k.secret,
+                adapter,
+            )
+            .await;
         }
     }
     let current = app.config.read().await;

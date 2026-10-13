@@ -28,6 +28,7 @@ pub struct KeyState {
     pub allowance: Option<Allowance>,
     pub balance_checked: i64,
     pub balance_error: Option<String>,
+    pub quota_probe_at: i64,
     pub service_failed: bool,
     pub suspect: bool,
     pub confirmation_at: i64,
